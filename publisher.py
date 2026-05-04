@@ -70,17 +70,19 @@ def read_content_from_row(row):
 
 def write_export_results(sheet, row_index, results, api_result=None):
     """
-    Writes export metadata to the Notes column and optionally the doc_url
-    to Blog Draft column.  If api_result is provided and has post_id/draft_url,
-    those are included in the notes summary.
+    Writes export metadata to the Notes column.
+    If api_result is provided and has post_id/draft_url, those are included.
+
+    IMPORTANT: We deliberately do NOT write doc_url back to COLUMNS["blog_draft"]
+    (column I).  That column holds the article markdown written by main.py.
+    Overwriting it with the Google Sheets tab URL destroys the markdown and causes
+    the next export run to build a postBody with only images/CTAs and no article text.
+    The doc_url is already captured in the message field and appears in Notes.
     """
-    doc_url = ""
-    ts      = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    ts          = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     notes_lines = [f"Exported at {ts}"]
 
     for result in results:
-        if result.get("doc_url"):
-            doc_url = result["doc_url"]
         msg = result.get("message", "")
         if msg:
             notes_lines.append(f"- {msg}")
@@ -90,9 +92,6 @@ def write_export_results(sheet, row_index, results, api_result=None):
         notes_lines.append(f"- HubSpot Post ID: {api_result['post_id']}")
         notes_lines.append(f"- HubSpot URL: {api_result.get('draft_url', '')}")
         notes_lines.append(f"- API status: {api_result.get('status_code', '')}")
-
-    if doc_url:
-        sheet.update_cell(row_index, COLUMNS["blog_draft"], doc_url)
 
     sheet.update_cell(row_index, COLUMNS["notes"], "\n".join(notes_lines))
 

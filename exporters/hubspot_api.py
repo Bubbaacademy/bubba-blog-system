@@ -73,16 +73,28 @@ def _map_to_api_payload(hs_data):
 
 # ── Pre-publish validator ─────────────────────────────────────────────────────
 
+# Hard thresholds — post is blocked if any of these are not met.
+MIN_WORD_COUNT  = 900
+MIN_H2_COUNT    = 4
+MIN_SECTIONS    = 5
+MIN_IMAGES      = 3
+# MAX_IMAGES accounts for 3 CTA images + up to 5 section images (≤10 article sections)
+MAX_IMAGES      = 8
+
+
 def validate_post_package(hs_data):
     """
     Pre-publish gatekeeper. Blocks publish on any failure.
 
     Checks:
-      Images  — no duplicates, all IDs in approved Pexels library
-      CTAs    — exactly 3 blocks, all hrefs in APPROVED_URLS or bubbaacademy.com
-      Links   — 0 placeholder/broken hrefs (FILL_IN), CTA anchor texts non-empty
-      SEO     — htmlTitle, metaDescription, slug all non-empty
-      Cluster — at least 0 cluster links (warns but does not block if 0)
+      Article text — word count ≥ 900, H2 count ≥ 4, section count ≥ 5,
+                     must contain real paragraph text (not just images/CTAs)
+      Images       — 3–6 total, no duplicates, all IDs in approved Pexels library
+      CTAs         — exactly 3 blocks, all hrefs in APPROVED_URLS or bubbaacademy.com
+      Form         — HubSpot form embed present
+      Links        — 0 placeholder/broken hrefs (FILL_IN)
+      SEO          — htmlTitle, metaDescription, slug all non-empty
+      Cluster      — warns but does not block if 0 cluster links
     """
     from config import APPROVED_URLS as APPR
     APPROVED_HREF_PREFIXES = tuple(APPR.values()) + ("https://bubbaacademy.com",)
@@ -91,6 +103,41 @@ def validate_post_package(hs_data):
     body   = post.get("postBody", "")
     errors = []
     warns  = []
+
+    # ── Article text quality ──────────────────────────────────────────────────
+    # Strip all HTML tags to get plain text for word counting
+    plain_text   = re.sub(r'<[^>]+>', ' ', body)
+    plain_text   = re.sub(r'\s+', ' ', plain_text).strip()
+    word_count   = len(plain_text.split()) if plain_text else 0
+    h2_count     = len(re.findall(r'<h2[\s>]', body))
+    # Count real content sections (hs-blog-section divs with non-trivial text)
+    section_divs = re.findall(r'<div class="hs-blog-section">(.*?)</div>', body, re.DOTALL)
+    text_sections = sum(
+        1 for s in section_divs
+        if len(re.sub(r'<[^>]+>', ' ', s).strip().split()) > 10
+    )
+    # Detect URL-only intro (blog_article was a URL instead of markdown)
+    intro_match = re.search(r'<div class="hs-blog-intro">(.*?)</div>', body, re.DOTALL)
+    intro_text  = re.sub(r'<[^>]+>', ' ', intro_match.group(1)).strip() if intro_match else ""
+    intro_is_url = (
+        intro_text.startswith("http://") or intro_text.startswith("https://")
+    ) and len(intro_text.split()) <= 3
+
+    if intro_is_url:
+        errors.append(
+            "Article intro is a URL, not article text. The Blog Draft Link column (I) "
+            "was overwritten by a previous export with a Google Sheets tab URL. "
+            "Reset column I to the original article markdown and re-run."
+        )
+    if word_count < MIN_WORD_COUNT:
+        errors.append(f"Article word count is {word_count} — minimum is {MIN_WORD_COUNT}")
+    if h2_count < MIN_H2_COUNT:
+        errors.append(f"Only {h2_count} H2 heading(s) in post body — minimum is {MIN_H2_COUNT}")
+    if text_sections < MIN_SECTIONS:
+        errors.append(
+            f"Only {text_sections} text section(s) with content — minimum is {MIN_SECTIONS}. "
+            f"Article may be missing sections or blog_article field is empty/a URL."
+        )
 
     # ── Images ────────────────────────────────────────────────────────────────
     img_urls   = re.findall(r'src="(https://[^"]+pexels[^"]+)"', body)
@@ -103,13 +150,16 @@ def validate_post_package(hs_data):
         errors.append(f"Duplicate image IDs: {duplicates}")
     if unverified:
         errors.append(f"Unapproved image IDs (not in curated library): {unverified}")
+    if len(img_urls) < MIN_IMAGES:
+        errors.append(f"Only {len(img_urls)} image(s) — minimum is {MIN_IMAGES}")
+    if len(img_urls) > MAX_IMAGES:
+        errors.append(f"{len(img_urls)} images — maximum is {MAX_IMAGES}")
 
     # ── CTAs ──────────────────────────────────────────────────────────────────
     cta_count    = len(re.findall(r'data-cta-type="', body))
     all_hrefs    = re.findall(r'href="([^"]+)"', body)
     bad_hrefs    = [h for h in all_hrefs if "FILL_IN" in h or not h.startswith("http")]
-    cta_hrefs    = re.findall(r'class="hs-cta-button"[^>]*href="([^"]+)"', body)  # CTA buttons
-    # Also catch hrefs in hs-cta-button elements (attribute order varies)
+    cta_hrefs    = re.findall(r'class="hs-cta-button"[^>]*href="([^"]+)"', body)
     cta_button_hrefs = re.findall(r'<a href="([^"]+)"[^>]*class="hs-cta-button"', body)
     all_cta_hrefs    = cta_hrefs + cta_button_hrefs
     unapproved_cta   = [
@@ -117,26 +167,20 @@ def validate_post_package(hs_data):
         if not any(h.startswith(p) for p in APPROVED_HREF_PREFIXES)
     ]
 
-    if cta_count < 3:
-        errors.append(f"Only {cta_count} CTA block(s) — expected 3")
+    if cta_count != 3:
+        errors.append(f"{cta_count} CTA block(s) — expected exactly 3")
     if bad_hrefs:
         errors.append(f"Placeholder/broken hrefs found: {bad_hrefs[:3]}")
     if unapproved_cta:
         errors.append(f"CTA hrefs not in APPROVED_URLS: {unapproved_cta}")
 
-    # ── Cluster / internal links ───────────────────────────────────────────────
-    approved_domains = set(
-        url.split("/")[2] for url in APPR.values()
-    )
-    cluster_links = [
-        h for h in all_hrefs
-        if any(h.split("/")[2] == d for d in approved_domains if "hs-sites" in d or "bubbaacademy" in d)
-        and "hs-cta-button" not in body[max(0, body.find(h)-50):body.find(h)+50]
-    ]
-    # Simpler: links to blog posts (not just cta buttons)
-    blog_links  = re.findall(r'href="(https://[^"]+hs-sites[^"]+)"', body)
-    main_links  = re.findall(r'href="(https://bubbaacademy\.com[^"]*)"[^>]*>(?!.*hs-cta)', body)
+    # ── HubSpot form embed ────────────────────────────────────────────────────
+    form_present = "hs-form-embed" in body or "data-form-id=" in body
+    if not form_present:
+        errors.append("HubSpot embedded form is missing from postBody")
 
+    # ── Cluster / internal links ───────────────────────────────────────────────
+    blog_links = re.findall(r'href="(https://[^"]+hs-sites[^"]+)"', body)
     if len(blog_links) == 0:
         warns.append("No cluster links to related blog posts found — consider adding topic cluster links")
 
@@ -149,13 +193,17 @@ def validate_post_package(hs_data):
         errors.append("Missing slug")
 
     report = {
+        "word_count":               word_count,
+        "h2_count":                 h2_count,
+        "text_sections":            text_sections,
         "image_count":              len(img_urls),
         "unique_image_count":       len(set(img_urls)),
         "duplicate_images":         duplicates or "none",
         "unverified_images":        unverified or "none",
-        "cta_blocks_present":       cta_count >= 3,
         "cta_count":                cta_count,
+        "cta_blocks_present":       cta_count == 3,
         "cta_hrefs_valid":          len(unapproved_cta) == 0,
+        "form_present":             form_present,
         "placeholder_hrefs":        bad_hrefs or "none",
         "cluster_links_to_posts":   len(blog_links),
         "meta_title_present":       bool(post.get("htmlTitle", "").strip()),
@@ -210,6 +258,49 @@ def create_hubspot_draft(hs_data, token):
 
     except requests.exceptions.ConnectionError:
         return {"success": False, "message": "HubSpot API: connection error — check internet or token"}
+    except requests.exceptions.Timeout:
+        return {"success": False, "message": "HubSpot API: request timed out after 30s"}
+    except Exception as e:
+        return {"success": False, "message": f"HubSpot API unexpected error: {e}"}
+
+
+def update_hubspot_draft(post_id, hs_data, token):
+    """
+    PATCHes an existing HubSpot draft post with a new postBody (and updated SEO fields).
+    Used to fix a previously created draft that had bad/empty content.
+
+    Returns:
+        dict with keys: success, message, post_id, draft_url, status_code
+    """
+    payload = _map_to_api_payload(hs_data)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    }
+    url = f"{HUBSPOT_API_URL}/{post_id}"
+
+    try:
+        response = requests.patch(url, headers=headers, json=payload, timeout=30)
+
+        if response.status_code in (200, 201, 204):
+            data      = response.json() if response.text else {}
+            draft_url = f"{HUBSPOT_BASE_URL}/{payload['slug']}"
+            return {
+                "success":     True,
+                "message":     f"HubSpot draft {post_id} updated successfully",
+                "post_id":     post_id,
+                "draft_url":   draft_url,
+                "status_code": response.status_code,
+            }
+        else:
+            return {
+                "success":     False,
+                "message":     f"HubSpot PATCH error {response.status_code}: {response.text[:300]}",
+                "status_code": response.status_code,
+            }
+
+    except requests.exceptions.ConnectionError:
+        return {"success": False, "message": "HubSpot API: connection error"}
     except requests.exceptions.Timeout:
         return {"success": False, "message": "HubSpot API: request timed out after 30s"}
     except Exception as e:
@@ -392,11 +483,18 @@ class HubSpotAPIExporter(BaseExporter):
         # ── Pre-publish validation ─────────────────────────────────────────────
         validation = validate_post_package(hs_data)
         hs_data["validation_report"] = validation["report"]
-        log.info(f"     Validation: cta_blocks={validation['report'].get('cta_count')} "
-                 f"images={validation['report'].get('image_count')} "
-                 f"duplicates={validation['report'].get('duplicate_images')} "
-                 f"meta_title={validation['report'].get('meta_title_present')} "
-                 f"slug={validation['report'].get('slug_present')}")
+        rpt = validation["report"]
+        log.info(
+            f"     Validation: words={rpt.get('word_count')} "
+            f"h2s={rpt.get('h2_count')} "
+            f"sections={rpt.get('text_sections')} "
+            f"cta_blocks={rpt.get('cta_count')} "
+            f"form={rpt.get('form_present')} "
+            f"images={rpt.get('image_count')} "
+            f"duplicates={rpt.get('duplicate_images')} "
+            f"meta_title={rpt.get('meta_title_present')} "
+            f"slug={rpt.get('slug_present')}"
+        )
 
         if not validation["valid"]:
             err_str = " | ".join(validation["errors"])

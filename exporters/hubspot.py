@@ -512,6 +512,23 @@ def _build_post_body(row, content):
     title     = row.get("Content Title", "")
     seo_title = content.get("seo_title", title)
 
+    # ── Guard: reject if blog_article is a URL or empty ──────────────────────
+    # This happens when the Blog Draft Link column was overwritten with a Google
+    # Sheets tab URL by a previous export.  A URL has no markdown sections and
+    # produces a postBody with zero article text.
+    _article_stripped = article.strip()
+    _is_url = (
+        _article_stripped.startswith("http://") or
+        _article_stripped.startswith("https://")
+    ) and "\n" not in _article_stripped and "##" not in _article_stripped
+    if not _article_stripped or _is_url:
+        raise ValueError(
+            f"blog_article contains {'a URL' if _is_url else 'no content'} instead of "
+            f"article markdown. The Blog Draft Link column was likely overwritten by a "
+            f"previous export. Reset column I (Blog Draft Link) in the sheet to the "
+            f"original article markdown and re-run."
+        )
+
     intro, sections, faq_md = _split_article(article)
     faq_items = _parse_faq(faq_md) if faq_md else []
 
