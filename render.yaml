@@ -1,0 +1,63 @@
+# render.yaml — Bubba Academy Content Agent
+# ==========================================
+# Defines two Render services:
+#   1. bubba-content-agent  (Web Service)  — health endpoint, always-on
+#   2. bubba-daily-publish  (Cron Job)     — runs pipeline on schedule
+#
+# Deploy: connect your GitHub repo in the Render dashboard and select
+# "Use render.yaml" during service creation, or run `render deploy`.
+#
+# All sensitive env vars (ANTHROPIC_API_KEY, HUBSPOT_TOKEN,
+# GOOGLE_CREDENTIALS_JSON) must be added manually in the Render
+# dashboard — they are NOT defined here for security reasons.
+
+services:
+
+  # ── Web Service (health endpoint + /status) ─────────────────────────────────
+  - type: web
+    name: bubba-content-agent
+    env: python
+    region: oregon               # change to your preferred Render region
+    plan: starter                # free tier works; upgrade for more memory
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:flask_app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false              # set manually in Render dashboard
+      - key: HUBSPOT_TOKEN
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: DRY_RUN
+        value: "false"
+      - key: HUBSPOT_MOCK_MODE
+        value: "false"
+      - key: PYTHON_VERSION
+        value: "3.11"
+
+  # ── Cron Job (scheduled pipeline run) ───────────────────────────────────────
+  - type: cron
+    name: bubba-daily-publish
+    env: python
+    region: oregon
+    schedule: "0 9 * * 1-5"    # 09:00 UTC Mon–Fri  (adjust to your timezone)
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py --run-once
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: HUBSPOT_TOKEN
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: DRY_RUN
+        value: "false"
+      - key: HUBSPOT_MOCK_MODE
+        value: "false"
+      - key: PYTHON_VERSION
+        value: "3.11"

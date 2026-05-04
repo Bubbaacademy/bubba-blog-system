@@ -1,0 +1,22 @@
+# Secrets — NEVER commit these
+.env
+credentials.json
+
+# Runtime output
+exports/
+logs/
+agent.log
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# OS
+.DS_Store
+Thumbs.db
