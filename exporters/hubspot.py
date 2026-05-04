@@ -681,15 +681,108 @@ def _build_hubspot_html(row, content, faq_items, faq_schema, article_schema):
 
 # ── Full hubspot.json ──────────────────────────────────────────────────────────
 
+def _auto_seo_title(title: str, keyword: str) -> str:
+    """
+    Generate a compelling SEO title when the sheet column is blank.
+    Rules: ≤60 chars, includes keyword naturally, ends cleanly.
+    """
+    import logging
+    _log = logging.getLogger("hubspot")
+    # Try: title as-is
+    candidate = title.strip()
+    if len(candidate) <= 60:
+        result = candidate
+    else:
+        # Truncate at last word boundary within 57 chars, add ellipsis
+        truncated = candidate[:57].rsplit(" ", 1)[0].rstrip(",;:")
+        result = truncated + "..."
+
+    # If keyword not already present (case-insensitive), append a short suffix
+    kw_lower = keyword.lower().strip()
+    if kw_lower and kw_lower not in result.lower():
+        suffix = f" | {keyword.title()}"
+        if len(result) + len(suffix) <= 60:
+            result = result + suffix
+
+    _log.info(f"  [SEO] Auto-generated htmlTitle: {result!r}  ({len(result)} chars)")
+    return result
+
+
+def _auto_meta_description(article: str, keyword: str, title: str) -> str:
+    """
+    Generate a 140–160 char meta description when the sheet column is blank.
+    Pulls the first meaningful sentence(s) from the article intro, then trims.
+    """
+    import re as _re
+    import logging
+    _log = logging.getLogger("hubspot")
+
+    # Strip markdown: remove headers, bold, links, list bullets
+    text = _re.sub(r'^#{1,6}\s+', '', article, flags=_re.MULTILINE)
+    text = _re.sub(r'\*{1,2}(.+?)\*{1,2}', r'\1', text)
+    text = _re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    text = _re.sub(r'^[-*]\s+', '', text, flags=_re.MULTILINE)
+    text = _re.sub(r'\s+', ' ', text).strip()
+
+    # Split into sentences and accumulate until we hit 140+ chars
+    sentences = _re.split(r'(?<=[.!?])\s+', text)
+    desc = ""
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent or len(sent) < 15:
+            continue
+        trial = (desc + " " + sent).strip()
+        if len(trial) <= 160:
+            desc = trial
+            if len(desc) >= 140:
+                break
+        else:
+            # Trim trial to 157 chars at last word boundary
+            trimmed = trial[:157].rsplit(" ", 1)[0].rstrip(",;:")
+            desc = trimmed + "..."
+            break
+
+    # Fallback: build from keyword + title
+    if len(desc) < 50:
+        kw_cap = keyword.title() if keyword else ""
+        desc = f"Learn about {kw_cap} in this complete guide by Bubba Academy — {title}."
+        if len(desc) > 160:
+            desc = desc[:157].rsplit(" ", 1)[0] + "..."
+
+    _log.info(f"  [SEO] Auto-generated metaDescription: {len(desc)} chars")
+    return desc
+
+
 def _build_hubspot_json(row, content, export_path, post_body_html):
+    import logging
+    _log = logging.getLogger("hubspot")
+
     slug         = _slugify(row.get("Content Title", "untitled"))
     tags         = _map_tags(row.get("Topic Cluster", ""))
     keyword      = row.get("Main Keyword", "")
     title        = row.get("Content Title", "")
-    seo_title    = content.get("seo_title", "")
-    meta_desc    = content.get("meta_description", "")
     publish_date = datetime.datetime.utcnow().strftime("%Y-%m-%dT07:00:00Z")
     link_opps    = _find_internal_link_opportunities(content.get("blog_article", ""))
+
+    # ── SEO fields: use sheet values; auto-generate if blank ──────────────────
+    seo_title = content.get("seo_title", "").strip()
+    meta_desc = content.get("meta_description", "").strip()
+    article   = content.get("blog_article", "")
+
+    seo_generated = False
+    if not seo_title:
+        seo_title     = _auto_seo_title(title, keyword)
+        seo_generated = True
+    if not meta_desc:
+        meta_desc     = _auto_meta_description(article, keyword, title)
+        seo_generated = True
+
+    if seo_generated:
+        _log.info("  [SEO] SEO fields generated and attached (sheet columns were blank)")
+        # Write back into content dict so publisher can persist them to the sheet
+        content["seo_title"]        = seo_title
+        content["meta_description"] = meta_desc
+        content["_seo_auto_generated"] = True
 
     _, _, faq_md = _split_article(content.get("blog_article", ""))
     faq_items    = _parse_faq(faq_md) if faq_md else []

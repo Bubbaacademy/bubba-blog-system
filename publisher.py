@@ -214,6 +214,22 @@ def run_publisher():
                                     "_exporter": exporter.name()})
                 row_failed = True
 
+        # ── Write back auto-generated SEO fields to sheet ────────────────────
+        # If the sheet had blank SEO Title / Meta Description columns and
+        # _build_hubspot_json auto-generated them, persist them back to columns
+        # O and P so the user can review/edit and future runs use stored values.
+        if content.get("_seo_auto_generated"):
+            try:
+                sheet.update_cell(row_index, COLUMNS["seo_title"], content.get("seo_title", ""))
+                sheet.update_cell(row_index, COLUMNS["meta_desc"],  content.get("meta_description", ""))
+                log.info(
+                    f"  [SEO] Wrote auto-generated fields back to sheet: "
+                    f"title={content.get('seo_title', '')[:40]!r} | "
+                    f"desc={content.get('meta_description', '')[:40]!r}..."
+                )
+            except Exception as seo_err:
+                log.warning(f"  [SEO] Could not write SEO fields back to sheet: {seo_err}")
+
         # ── Validation report log (if API ran it) ─────────────────────────────
         for r in all_results:
             if r.get("validation"):
