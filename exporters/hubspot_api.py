@@ -298,16 +298,24 @@ class HubSpotAPIExporter(BaseExporter):
     """
     Runs AFTER HubSpotExporter (which writes hubspot.json).
 
-    Decision tree:
-        ready_for_api == false  →  SAFE MODE:  log and skip
-        HUBSPOT_MOCK_MODE == True → MOCK MODE: log payload, no request
-        Both false              →  LIVE MODE:  POST to HubSpot API
+    Decision tree (evaluated in order):
+        DRY_RUN env var == "true"   →  SKIP: exporter not included in pipeline
+        HUBSPOT_MOCK_MODE == True   →  MOCK MODE: log payload, no request
+        DRY_RUN == "false" (default)→  LIVE MODE: POST to HubSpot API
+
+    NOTE: ready_for_api in hubspot.json is a local-dev manual override.
+    In cloud deployments, DRY_RUN env var is the authoritative publish gate.
+    When DRY_RUN=false, the API call is always attempted regardless of
+    the ready_for_api flag written into hubspot.json.
     """
 
     def name(self):
         return "HubSpotAPIExporter"
 
     def export(self, row, content):
+        import logging
+        log = logging.getLogger("hubspot_api")
+
         export_path = get_export_path(row)
         json_path   = os.path.join(export_path, "hubspot.json")
 
@@ -321,13 +329,22 @@ class HubSpotAPIExporter(BaseExporter):
         with open(json_path, encoding="utf-8") as f:
             hs_data = json.load(f)
 
-        ready = hs_data.get("hubspot_meta", {}).get("ready_for_api", False)
+        # ── Determine publish mode ─────────────────────────────────────────────
+        # DRY_RUN=false (cloud default) → always go live.
+        # DRY_RUN=true                  → exporter was excluded from pipeline;
+        #   if somehow reached here, honour it as safe mode.
+        dry_run   = os.environ.get("DRY_RUN", "false").lower() == "true"
+        json_flag = hs_data.get("hubspot_meta", {}).get("ready_for_api", False)
 
-        # ── SAFE MODE ──────────────────────────────────────────────────────────
+        # In live mode the env var takes priority over the JSON flag.
+        # The JSON flag (ready_for_api) only gates when DRY_RUN is not set.
+        ready = True if not dry_run else json_flag
+
+        # ── SAFE MODE (only when DRY_RUN=true or unset and flag is false) ─────
         if not ready:
             msg = (
-                "HubSpot API — SAFE MODE: ready_for_api is false. "
-                "No request sent. Set ready_for_api=true in hubspot.json to publish."
+                "HubSpot API — SAFE MODE: DRY_RUN=true or ready_for_api is false. "
+                "No request sent."
             )
             print(f"     {msg}")
             return {"success": True, "message": msg, "skipped": True, "mode": "safe"}
@@ -337,25 +354,21 @@ class HubSpotAPIExporter(BaseExporter):
             payload = _map_to_api_payload(hs_data)
             print(f"     HubSpot API — MOCK MODE: would POST to {HUBSPOT_API_URL}")
             print(f"     Payload preview:")
-            print(f"       name         : {payload['name']}")
-            print(f"       htmlTitle    : {payload['htmlTitle']}")
-            print(f"       slug         : {payload['slug']}")
+            print(f"       name          : {payload['name']}")
+            print(f"       htmlTitle     : {payload['htmlTitle']}")
+            print(f"       slug          : {payload['slug']}")
             print(f"       contentGroupId: {payload['contentGroupId']}")
-            print(f"       state        : {payload['state']}")
-            print(f"       tagNames       : {payload['tagNames']}")
-            print(f"       useFeaturedImage: {payload['useFeaturedImage']}")
-            print(f"       featuredImage  : {payload.get('featuredImage', '(none)')}")
-            print(f"       postBody len   : {len(payload['postBody'])} chars")
-            print(f"       [No request sent — HUBSPOT_MOCK_MODE=True in config.py]")
+            print(f"       blogAuthorId  : {payload['blogAuthorId']}")
+            print(f"       state         : {payload['state']}")
+            print(f"       tagNames      : {payload['tagNames']}")
+            print(f"       postBody len  : {len(payload['postBody'])} chars")
+            print(f"       [No request sent — HUBSPOT_MOCK_MODE=True]")
 
-            # Write mock result to hubspot.json for audit trail
             hs_data["hubspot_api_mock"] = {
-                "mock_run_at": datetime.datetime.utcnow().isoformat() + "Z",
-                "endpoint":    HUBSPOT_API_URL,
-                "payload_keys": list(payload.keys()),
-                "payload_preview": {
-                    k: v for k, v in payload.items() if k != "postBody"
-                },
+                "mock_run_at":    datetime.datetime.utcnow().isoformat() + "Z",
+                "endpoint":       HUBSPOT_API_URL,
+                "payload_keys":   list(payload.keys()),
+                "payload_preview": {k: v for k, v in payload.items() if k != "postBody"},
             }
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(hs_data, f, indent=2, ensure_ascii=False)
@@ -373,28 +386,43 @@ class HubSpotAPIExporter(BaseExporter):
         if not token or token == "YOUR_HUBSPOT_PRIVATE_APP_TOKEN":
             return {
                 "success": False,
-                "message": "HubSpot API — LIVE MODE failed: HUBSPOT_TOKEN not set in .env",
+                "message": "HubSpot API — LIVE MODE failed: HUBSPOT_TOKEN not set in environment",
             }
 
         # ── Pre-publish validation ─────────────────────────────────────────────
         validation = validate_post_package(hs_data)
         hs_data["validation_report"] = validation["report"]
-        print(f"     Validation report: {validation['report']}")
+        log.info(f"     Validation: cta_blocks={validation['report'].get('cta_count')} "
+                 f"images={validation['report'].get('image_count')} "
+                 f"duplicates={validation['report'].get('duplicate_images')} "
+                 f"meta_title={validation['report'].get('meta_title_present')} "
+                 f"slug={validation['report'].get('slug_present')}")
 
         if not validation["valid"]:
             err_str = " | ".join(validation["errors"])
-            msg = f"HubSpot API — BLOCKED by validation: {err_str}"
-            print(f"     {msg}")
+            msg = f"HubSpot API — BLOCKED by pre-publish validation: {err_str}"
+            log.error(f"     {msg}")
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(hs_data, f, indent=2, ensure_ascii=False)
             return {"success": False, "message": msg, "mode": "live", "validation": validation}
 
+        # ── API call ───────────────────────────────────────────────────────────
+        post = hs_data.get("post", {})
+        log.info(f"     Creating HubSpot post via API...")
+        log.info(f"       Title : {post.get('name', '')}")
+        log.info(f"       Slug  : {post.get('slug', '')}")
+        log.info(f"       Blog  : {HUBSPOT_BLOG_ID}  Author: {HUBSPOT_AUTHOR_ID}")
+
         result = create_hubspot_draft(hs_data, token)
 
-        if result["success"]:
-            print(f"     HubSpot draft created successfully — post ID: {result.get('post_id')}")
+        log.info(f"     HubSpot API response status: {result.get('status_code', 'N/A')}")
 
-            # Write API result back into hubspot.json for audit trail
+        if result["success"]:
+            log.info(f"     HubSpot Post ID: {result.get('post_id')}")
+            log.info(f"     HubSpot URL: {result.get('draft_url')}")
+            print(f"     HubSpot draft created — Post ID: {result.get('post_id')}")
+            print(f"     HubSpot URL: {result.get('draft_url')}")
+
             hs_data["hubspot_api_result"] = {
                 "published_at": datetime.datetime.utcnow().isoformat() + "Z",
                 "post_id":      result.get("post_id"),
@@ -404,6 +432,7 @@ class HubSpotAPIExporter(BaseExporter):
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(hs_data, f, indent=2, ensure_ascii=False)
         else:
+            log.error(f"     HubSpot API error: {result['message']}")
             print(f"     HubSpot API error: {result['message']}")
 
         result["mode"] = "live"

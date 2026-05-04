@@ -36,6 +36,7 @@ STATUS_OUTPUT       = STATUS_DRAFT_READY  # kept for backwards compat
 STATUS_APPROVED     = "Approved"
 STATUS_EXPORTED     = "Exported"
 STATUS_PUBLISHED    = "Published"
+STATUS_FAILED       = "Failed"
 
 APPROVAL_TRIGGER    = "Yes"
 
