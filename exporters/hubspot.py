@@ -532,8 +532,13 @@ def _build_post_body(row, content):
     intro, sections, faq_md = _split_article(article)
     faq_items = _parse_faq(faq_md) if faq_md else []
 
-    # One tracker per post — enforces no duplicate images
-    tracker = ImageTracker()
+    # One tracker per post — enforces no duplicate images within the post.
+    # article_keyword + article_topic_cluster drive category gating: PPC/ads
+    # topics receive no section images; warehouse/FBA topics get matched images.
+    tracker = ImageTracker(
+        article_keyword=keyword,
+        article_topic_cluster=row.get("Topic Cluster", ""),
+    )
 
     # Determine self URL key to prevent self-linking
     slug = _slugify(row.get("Content Title", ""))
@@ -584,13 +589,18 @@ def _build_post_body(row, content):
 
         html_parts.append(f'<div class="hs-blog-section">\n{section_html}\n</div>')
 
-        # Contextual section image after every 2nd section
+        # Contextual section image after every 2nd section.
+        # tracker.section() returns None when:
+        #   • topic is PPC/ads (no category match) → never insert unrelated images
+        #   • all images in allowed categories are exhausted
+        # In both cases we skip silently — the tracker already logged the reason.
         if (i + 1) % 2 == 0:
             context = heading_text + " " + keyword
             img_url = tracker.section(context, section_img_idx)
-            img_alt = f"{heading_text} — {keyword} | Bubba Academy"
-            html_parts.append(_img_tag(img_url, img_alt, "section"))
-            section_img_idx += 1
+            if img_url is not None:
+                img_alt = f"{heading_text} — {keyword} | Bubba Academy"
+                html_parts.append(_img_tag(img_url, img_alt, "section"))
+                section_img_idx += 1
 
         # ── CTA 2: Contextual mid-article (topic-specific persuasion) ────────
         if i == mid - 1:

@@ -525,20 +525,41 @@ class HubSpotAPIExporter(BaseExporter):
 
         # ── Register images in global registry (validation passed) ─────────────
         # Commit BEFORE the API call so images are reserved even if the API fails.
+        # Uses the Sheets-backed registry so IDs persist across Render deploys.
         try:
-            from exporters.image_selector import get_global_registry
+            from exporters.sheets_image_registry import get_sheets_registry
             body_for_imgs = hs_data.get("post", {}).get("postBody", "")
-            img_ids_used = [
+            img_urls_used = re.findall(r'src="(https://[^"]+pexels[^"]+)"', body_for_imgs)
+            slug_for_reg  = hs_data.get("post", {}).get("slug", "unknown")
+
+            # Build per-image entries with type (section vs cta)
+            # CTA images appear inside data-cta-type blocks; others are section images.
+            cta_block_ids = set(
                 m.group(1)
                 for m in (
                     re.search(r'/photos/(\d+)/', u)
-                    for u in re.findall(r'src="(https://[^"]+pexels[^"]+)"', body_for_imgs)
+                    for u in re.findall(
+                        r'data-cta-type="[^"]*"[^<]*<[^>]*src="(https://[^"]+pexels[^"]+)"',
+                        body_for_imgs,
+                    )
                 )
                 if m
-            ]
-            slug_for_reg = hs_data.get("post", {}).get("slug", "unknown")
-            get_global_registry().register_post(slug_for_reg, img_ids_used)
-            log.info(f"     [ImageRegistry] Committed {len(img_ids_used)} image(s) for '{slug_for_reg}'")
+            )
+
+            entries = []
+            for u in img_urls_used:
+                m = re.search(r'/photos/(\d+)/', u)
+                if m:
+                    pid = m.group(1)
+                    img_type = "cta" if pid in cta_block_ids else "section"
+                    entries.append({"id": pid, "url": u, "type": img_type})
+
+            registry = get_sheets_registry()
+            registry.register_post(slug_for_reg, entries)
+            log.info(
+                f"     [ImageRegistry] Committed {len(entries)} image(s) for '{slug_for_reg}' "
+                f"(connected={registry._connected})"
+            )
         except Exception as img_err:
             log.warning(f"     [ImageRegistry] Could not commit images: {img_err}")
 
