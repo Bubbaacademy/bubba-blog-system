@@ -247,14 +247,17 @@ def run_publisher():
         elif api_result and api_result.get("mode") == "live" and api_result.get("success"):
             # ── Case A: API succeeded ─────────────────────────────────────────
             post_id   = api_result.get("post_id", "")
-            draft_url = api_result.get("draft_url", "")
+            live_url  = api_result.get("draft_url", "")  # draft_url is now the live URL
+            published = api_result.get("published", False)
             write_export_results(sheet, row_index, all_results, api_result=api_result)
-            write_hubspot_url(sheet, row_index, draft_url)
+            write_hubspot_url(sheet, row_index, live_url)
             update_status(sheet, row_index, STATUS_EXPORTED)
-            log.info(f"  Status → '{STATUS_EXPORTED}'  Post ID: {post_id}  URL: {draft_url}")
+            pub_label = "PUBLISHED" if published else "DRAFT (publish step failed — manual publish needed)"
+            log.info(f"  Status → '{STATUS_EXPORTED}'  Post ID: {post_id}  HubSpot: {pub_label}  URL: {live_url}")
             print(f"  Status updated to '{STATUS_EXPORTED}'.")
             print(f"  HubSpot Post ID: {post_id}")
-            print(f"  HubSpot URL: {draft_url}\n")
+            print(f"  HubSpot state:   {pub_label}")
+            print(f"  HubSpot URL:     {live_url}\n")
             success += 1
 
         else:

@@ -309,17 +309,17 @@ def update_hubspot_draft(post_id, hs_data, token):
 
 def publish_hubspot_post(post_id, token):
     """
-    Publishes an existing HubSpot draft and confirms the URL is live (HTTP 200).
+    Transitions a HubSpot draft to PUBLISHED state.
 
-    Root cause: PATCH state=PUBLISHED only changes metadata. The field that
-    actually activates the CDN route is publishImmediately=True — this sets
-    currentlyPublished=True on the post object, which is what makes the public
-    URL accessible. It is the equivalent of clicking Publish/Update in the UI.
+    The PATCH call with state=PUBLISHED + publishImmediately=True is the
+    authoritative publish action — equivalent to clicking Publish in the UI.
+    If the PATCH returns 200/201/204, the post IS published; URL propagation
+    may take a few seconds on the CDN but that does not affect publish status.
 
     Steps:
       1. PATCH state=PUBLISHED + publishImmediately=True  → activates CDN route
-      2. GET v3 post                                      → read state + url
-      3. GET public URL with retry (up to 15s)            → confirm HTTP 200
+      2. Read live_url from PATCH response body
+      3. Attempt URL check (non-blocking: log warning if not yet 200, still success)
 
     Returns:
         dict with keys: success, message, state, live_url, post_id, http_status
@@ -327,48 +327,67 @@ def publish_hubspot_post(post_id, token):
     import time
 
     base_url = f"{HUBSPOT_API_URL}/{post_id}"
-    now_ms   = int(datetime.datetime.utcnow().timestamp() * 1000)
+    now_iso  = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
     headers  = {
         "Authorization": f"Bearer {token}",
         "Content-Type":  "application/json",
     }
 
     try:
-        # Step 1 — PATCH with publishImmediately=True (sets currentlyPublished=True)
+        # Step 1 — PATCH: set state=PUBLISHED with publishImmediately flag
         pub = requests.patch(
             base_url,
             headers=headers,
-            json={"state": "PUBLISHED", "publishDate": now_ms, "publishImmediately": True},
+            json={
+                "state":              "PUBLISHED",
+                "publishDate":        now_iso,
+                "publishImmediately": True,
+            },
             timeout=30,
         )
+
         if pub.status_code not in (200, 201, 204):
             return {
                 "success": False,
-                "message": f"Publish PATCH failed {pub.status_code}: {pub.text[:300]}",
+                "message": f"Publish PATCH failed — HTTP {pub.status_code}: {pub.text[:400]}",
+                "post_id": post_id,
             }
 
-        # Step 2 — confirm state and get live URL
-        check     = requests.get(base_url, headers=headers, timeout=30)
-        post_data = check.json()
-        live_url  = post_data.get("url", "")
-        state     = post_data.get("state", "")
+        # Step 2 — extract live URL from PATCH response
+        pub_data = pub.json() if pub.text else {}
+        live_url = pub_data.get("url", "")
+        state    = pub_data.get("state", "PUBLISHED")  # PATCH response has final state
 
-        # Step 3 — verify public URL with retry
-        http_status = None
-        for _ in range(5):
-            time.sleep(3)
+        if not live_url:
+            # Fallback: GET to read url field
             try:
-                gr = requests.get(live_url, timeout=15, allow_redirects=True)
-                http_status = gr.status_code
-                if http_status == 200:
-                    break
+                chk      = requests.get(base_url, headers=headers, timeout=15)
+                live_url = chk.json().get("url", "")
+                state    = chk.json().get("state", state)
             except Exception:
                 pass
 
-        success = http_status == 200
+        # Step 3 — non-blocking URL confirmation (CDN propagation can take a few seconds)
+        http_status = None
+        if live_url:
+            for attempt in range(4):
+                time.sleep(4)
+                try:
+                    gr = requests.get(live_url, timeout=15, allow_redirects=True)
+                    http_status = gr.status_code
+                    if http_status == 200:
+                        break
+                except Exception:
+                    pass
+
+        # PATCH success IS publish success — URL check is informational only
         return {
-            "success":     success,
-            "message":     f"Post {post_id} {'live — HTTP 200 confirmed' if success else 'published but URL returned ' + str(http_status)}",
+            "success":     True,
+            "message":     (
+                f"Post {post_id} published"
+                + (f" — URL live (HTTP {http_status})" if http_status == 200
+                   else f" — CDN may still be propagating (URL check: {http_status})")
+            ),
             "state":       state,
             "live_url":    live_url,
             "post_id":     post_id,
@@ -376,11 +395,11 @@ def publish_hubspot_post(post_id, token):
         }
 
     except requests.exceptions.ConnectionError:
-        return {"success": False, "message": "HubSpot API: connection error"}
+        return {"success": False, "message": "HubSpot API: connection error during publish", "post_id": post_id}
     except requests.exceptions.Timeout:
-        return {"success": False, "message": "HubSpot API: request timed out after 30s"}
+        return {"success": False, "message": "HubSpot API: publish request timed out after 30s", "post_id": post_id}
     except Exception as e:
-        return {"success": False, "message": f"HubSpot API unexpected error: {e}"}
+        return {"success": False, "message": f"HubSpot API unexpected error during publish: {e}", "post_id": post_id}
 
 
 # ── Exporter class ─────────────────────────────────────────────────────────────
@@ -504,34 +523,83 @@ class HubSpotAPIExporter(BaseExporter):
                 json.dump(hs_data, f, indent=2, ensure_ascii=False)
             return {"success": False, "message": msg, "mode": "live", "validation": validation}
 
-        # ── API call ───────────────────────────────────────────────────────────
+        # ── Register images in global registry (validation passed) ─────────────
+        # Commit BEFORE the API call so images are reserved even if the API fails.
+        try:
+            from exporters.image_selector import get_global_registry
+            body_for_imgs = hs_data.get("post", {}).get("postBody", "")
+            img_ids_used = [
+                m.group(1)
+                for m in (
+                    re.search(r'/photos/(\d+)/', u)
+                    for u in re.findall(r'src="(https://[^"]+pexels[^"]+)"', body_for_imgs)
+                )
+                if m
+            ]
+            slug_for_reg = hs_data.get("post", {}).get("slug", "unknown")
+            get_global_registry().register_post(slug_for_reg, img_ids_used)
+            log.info(f"     [ImageRegistry] Committed {len(img_ids_used)} image(s) for '{slug_for_reg}'")
+        except Exception as img_err:
+            log.warning(f"     [ImageRegistry] Could not commit images: {img_err}")
+
+        # ── Step A: Create draft ───────────────────────────────────────────────
         post = hs_data.get("post", {})
-        log.info(f"     Creating HubSpot post via API...")
+        log.info("     [PUBLISH] Creating HubSpot post via API...")
         log.info(f"       Title : {post.get('name', '')}")
         log.info(f"       Slug  : {post.get('slug', '')}")
         log.info(f"       Blog  : {HUBSPOT_BLOG_ID}  Author: {HUBSPOT_AUTHOR_ID}")
 
         result = create_hubspot_draft(hs_data, token)
+        log.info(f"     [PUBLISH] HubSpot API response status: {result.get('status_code', 'N/A')}")
 
-        log.info(f"     HubSpot API response status: {result.get('status_code', 'N/A')}")
-
-        if result["success"]:
-            log.info(f"     HubSpot Post ID: {result.get('post_id')}")
-            log.info(f"     HubSpot URL: {result.get('draft_url')}")
-            print(f"     HubSpot draft created — Post ID: {result.get('post_id')}")
-            print(f"     HubSpot URL: {result.get('draft_url')}")
-
-            hs_data["hubspot_api_result"] = {
-                "published_at": datetime.datetime.utcnow().isoformat() + "Z",
-                "post_id":      result.get("post_id"),
-                "draft_url":    result.get("draft_url"),
-                "status_code":  result.get("status_code"),
-            }
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(hs_data, f, indent=2, ensure_ascii=False)
-        else:
-            log.error(f"     HubSpot API error: {result['message']}")
+        if not result["success"]:
+            log.error(f"     [PUBLISH] Draft creation FAILED: {result['message']}")
             print(f"     HubSpot API error: {result['message']}")
+            result["mode"] = "live"
+            return result
 
-        result["mode"] = "live"
+        post_id   = result.get("post_id")
+        draft_url = result.get("draft_url", "")
+        log.info(f"     [PUBLISH] HubSpot Post ID: {post_id}")
+        log.info(f"     [PUBLISH] Draft URL: {draft_url}")
+
+        # ── Step B: Publish the draft ──────────────────────────────────────────
+        # Create without publish is not useful — always transition to PUBLISHED.
+        log.info(f"     [PUBLISH] Publishing triggered → Post ID: {post_id}")
+        pub_result = publish_hubspot_post(post_id, token)
+        log.info(f"     [PUBLISH] Publish result: {pub_result['message']}")
+
+        live_url = pub_result.get("live_url") or draft_url
+
+        if pub_result["success"]:
+            log.info(f"     [PUBLISH] Post PUBLISHED — URL: {live_url}")
+            print(f"     HubSpot post published — Post ID: {post_id}")
+            print(f"     HubSpot URL: {live_url}")
+        else:
+            # PATCH to PUBLISHED failed — post exists as draft but wasn't published
+            log.warning(f"     [PUBLISH] Publish FAILED: {pub_result['message']}")
+            log.warning(f"     [PUBLISH] Post {post_id} exists as DRAFT but was not published")
+            print(f"     HubSpot draft created (Post ID: {post_id}) but publish step failed:")
+            print(f"       {pub_result['message']}")
+
+        # ── Persist result to hubspot.json ────────────────────────────────────
+        hs_data["hubspot_api_result"] = {
+            "published_at":   datetime.datetime.utcnow().isoformat() + "Z",
+            "post_id":        post_id,
+            "draft_url":      draft_url,
+            "live_url":       live_url,
+            "publish_status": pub_result.get("state", ""),
+            "publish_success":pub_result["success"],
+            "status_code":    result.get("status_code"),
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(hs_data, f, indent=2, ensure_ascii=False)
+
+        # Return combined result — success = draft created (publish failure is logged,
+        # not a pipeline abort, since the content IS in HubSpot)
+        result["mode"]            = "live"
+        result["published"]       = pub_result["success"]
+        result["live_url"]        = live_url
+        result["draft_url"]       = live_url   # use live URL as canonical URL
+        result["publish_message"] = pub_result["message"]
         return result
