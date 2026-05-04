@@ -539,8 +539,12 @@ def _build_post_body(row, content):
     html_parts.append(_cta_block_v2("lead-magnet", "after-introduction", 1, tracker.cta(0)))
 
     # ── Sections ──────────────────────────────────────────────────────────────
-    section_img_idx = 0
-    mid             = max(2, len(sections) // 2)
+    section_img_idx  = 0
+    # mid is the 0-based index after which CTA 2 is injected.
+    # With ≥2 sections: halfway point. With 1 section: after that section (i==0).
+    # With 0 sections: loop never runs — handled by mid_cta_injected guard below.
+    mid              = max(1, len(sections) // 2) if sections else 0
+    mid_cta_injected = False
 
     for i, section in enumerate(sections):
         heading_match = re.match(r'^## (.+)', section)
@@ -576,6 +580,16 @@ def _build_post_body(row, content):
             html_parts.append(
                 _cta_block_v2("contextual", "mid-article", 2, tracker.cta(1), keyword)
             )
+            mid_cta_injected = True
+
+    # ── CTA 2 fallback: guarantee injection even with 0-1 sections ───────────
+    # This is the safety net — if the AI produced no sections (e.g. URL in
+    # blog_draft field, very short article, or only intro text), CTA 2 is
+    # always placed here, between intro and the HubSpot form.
+    if not mid_cta_injected:
+        html_parts.append(
+            _cta_block_v2("contextual", "mid-article", 2, tracker.cta(1), keyword)
+        )
 
     # ── HubSpot Form (after conclusion, before conversion CTA) ───────────────
     html_parts.append(_hubspot_form_block())
