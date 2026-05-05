@@ -78,7 +78,20 @@ def _find_internal_link_opportunities(text):
 # ── Image placeholder ──────────────────────────────────────────────────────────
 
 def _img_tag(img_url, alt_text, img_type="section", css_class="hs-blog-image"):
-    """Renders a real image tag with a verified URL. No placeholders."""
+    """
+    Renders a real image tag with a verified URL. No placeholders.
+    Returns empty string if img_url is None — caller skips the block.
+    Only hubspotusercontent.com URLs are accepted; anything else is blocked.
+    """
+    if not img_url:
+        return ""
+    # Hard block: reject any non-HubSpot URL before it enters the HTML
+    if "hubspotusercontent.com" not in img_url:
+        import logging as _log
+        _log.getLogger("hubspot").warning(
+            f"[IMAGE_VALIDATION_BLOCKED] Rejected non-HubSpot URL: {img_url[:80]}"
+        )
+        return ""
     safe_alt = alt_text.replace('"', "'")
     return (
         f'<div class="hs-blog-image hs-blog-image--{img_type}">\n'
@@ -323,8 +336,8 @@ def _cta_block_v2(cta_type, placement, index, img_url, keyword=""):
             f'<ul style="margin: 0 0 8px 0; padding: 0;">\n{items}\n  </ul>'
         )
 
-    # ── CTA image ──────────────────────────────────────────────────────────────
-    img = _img_tag(img_url, meta["alt"], "cta", "hs-cta-image")
+    # ── CTA image (AI-generated only; omitted if no image available) ───────────
+    img = _img_tag(img_url, meta["alt"], "cta", "hs-cta-image") if img_url else ""
 
     return f"""
 {img}

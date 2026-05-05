@@ -172,8 +172,9 @@ class OpenAIImageProvider(ImageProvider):
             provider_id    = hashlib.sha256(revised_prompt.encode()).hexdigest()[:16]
 
             log.info(
-                f"[IMAGE_PROVIDER] DALL-E 3 generated  "
+                f"[AI_IMAGE_GENERATED] provider=dall-e-3  "
                 f"provider_id={provider_id}  "
+                f"prompt_hash={prompt.prompt_hash}  "
                 f"temp_url={temp_url[:80]}"
             )
 
@@ -206,9 +207,8 @@ class OpenAIImageProvider(ImageProvider):
                 return None
 
             log.info(
-                f"[IMAGE_SELECTED] role={slot_name}  "
-                f"source=openai  "
-                f"provider_id={provider_id}  "
+                f"[HUBSPOT_FILE_UPLOADED] provider_id={provider_id}  "
+                f"slot={slot_name}  "
                 f"url={permanent_url[:80]}"
             )
 
@@ -408,23 +408,22 @@ def get_provider(force: str = "") -> ImageProvider:
     if override == "none":
         return NullImageProvider()
 
-    # Auto-select: try in priority order
+    # Auto-select: OpenAI DALL-E 3 only. Pexels is NOT used as an automatic
+    # fallback — it returns warehouse/stock images that are indistinguishable
+    # from the old static catalog for non-FBA topics.
+    # To force Pexels manually: set IMAGE_PROVIDER=pexels (not recommended).
     if _provider is None:
         openai_p = OpenAIImageProvider()
         if openai_p.available:
             _provider = openai_p
             log.info("[IMAGE_PROVIDER] Auto-selected: OpenAI DALL-E 3")
         else:
-            pexels_p = PexelsImageProvider()
-            if pexels_p.available:
-                _provider = pexels_p
-                log.info("[IMAGE_PROVIDER] Auto-selected: Pexels (DALL-E not available)")
-            else:
-                _provider = NullImageProvider()
-                log.info(
-                    "[IMAGE_PROVIDER] Auto-selected: None "
-                    "(set OPENAI_API_KEY or PEXELS_API_KEY to enable images)"
-                )
+            _provider = NullImageProvider()
+            log.info(
+                "[IMAGE_PROVIDER] Auto-selected: None — OPENAI_API_KEY not set. "
+                "Articles will publish without images. "
+                "Set OPENAI_API_KEY to enable AI-generated images."
+            )
 
     return _provider
 

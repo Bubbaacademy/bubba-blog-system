@@ -301,7 +301,7 @@ def generate_prompt(
     )
 
     log.info(
-        f"[IMAGE_PROMPT] slot={slot}  "
+        f"[AI_IMAGE_PROMPT] slot={slot}  "
         f"category={topic_category}  "
         f"basis={basis}  "
         f"prompt_len={len(full_prompt)}"

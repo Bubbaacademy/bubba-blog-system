@@ -242,6 +242,12 @@ class ImageSelectionService:
             provider_id     = asset.provider_id,
         )
         self._record(sel)
+        log.info(
+            f"[IMAGE_INSERTED] role=hero  "
+            f"source={asset.provider}  "
+            f"provider_id={asset.provider_id}  "
+            f"url={asset.url[:80]}"
+        )
         return asset.url
 
     def section(
@@ -292,64 +298,57 @@ class ImageSelectionService:
         )
         self._record(sel)
         self._section_count += 1
+        log.info(
+            f"[IMAGE_INSERTED] role=section  "
+            f"source={asset.provider}  "
+            f"provider_id={asset.provider_id}  "
+            f"url={asset.url[:80]}"
+        )
         return asset.url
 
-    def cta(self, slot: int = 0) -> str:
+    def cta(self, slot: int = 0) -> "str | None":
         """
-        Select CTA image from the static catalog.
+        Select CTA image using AI generation (same provider as section/hero).
 
-        Always returns a URL — CTA images are mandatory decorative blocks.
-        Uses ONLY static catalog (reusable_cta=True images).
-        NEVER uses AI or Pexels for CTA blocks.
-        Rotates to avoid within-post duplicates.
+        Returns URL or None.
+        - NEVER uses the static catalog.
+        - NEVER uses Pexels.
+        - If AI provider is unavailable or returns None → CTA block publishes
+          without an image (caller must handle None gracefully).
         """
-        cta_pool  = get_approved(role=ROLE_CTA, reusable_cta=True)
-        survivors = []
+        context = f"cta_slot_{slot}_{self._topic_category}"
+        asset = self._fetch_image(ROLE_CTA, context)
 
-        for entry in cta_pool:
-            if entry.url in self._used_urls:
-                continue
-            passed, reason, score = _evaluate_cta_gates(entry)
-            if passed:
-                survivors.append((score, entry))
-
-        if survivors:
-            _, best = max(survivors, key=lambda x: x[0])
-            sel = ImageSelection(
-                image_id        = best.image_id,
-                url             = best.url,
-                role            = ROLE_CTA,
-                category        = best.category,
-                visual_cluster  = best.visual_cluster,
-                relevance_score = 1.0,
-                context         = f"cta_slot_{slot}",
-                source          = "static_catalog",
-                search_query    = "",
-                prompt_hash     = "",
-                provider_id     = best.image_id,
-            )
-            self._record(sel)
+        if asset is None:
             log.info(
-                f"[IMAGE_SELECTED] role=cta  "
-                f"id={best.image_id}  slot={slot}  "
-                f"url={best.url[:80]}"
+                f"[IMAGE_SKIPPED] role=cta  slot={slot}  "
+                f"reason=NO_AI_IMAGE_RETURNED  "
+                f"provider={self._provider.name}  "
+                f"topic='{self._topic_category}'"
             )
-            return best.url
+            return None
 
-        # Hard fallback: force-cycle through pool if all used
-        if cta_pool:
-            fallback = cta_pool[slot % len(cta_pool)]
-            log.warning(
-                f"[IMAGE_SKIPPED] CTA slot={slot} pool exhausted — "
-                f"force-cycling to {fallback.image_id}"
-            )
-            # Temporarily allow reuse for this CTA slot
-            self._used_urls.discard(fallback.url)
-            return self.cta(slot)
-
-        raise RuntimeError(
-            "CTA catalog is empty — add at least 3 approved CTA images to IMAGE_CATALOG"
+        sel = ImageSelection(
+            image_id        = asset.image_id,
+            url             = asset.url,
+            role            = ROLE_CTA,
+            category        = self._topic_category,
+            visual_cluster  = asset.visual_cluster,
+            relevance_score = 1.0,
+            context         = context,
+            source          = asset.provider,
+            search_query    = asset.search_query,
+            prompt_hash     = asset.prompt_hash,
+            provider_id     = asset.provider_id,
         )
+        self._record(sel)
+        log.info(
+            f"[IMAGE_INSERTED] role=cta  slot={slot}  "
+            f"source={asset.provider}  "
+            f"provider_id={asset.provider_id}  "
+            f"url={asset.url[:80]}"
+        )
+        return asset.url
 
     # ── Registry commit ───────────────────────────────────────────────────────
 

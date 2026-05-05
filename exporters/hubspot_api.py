@@ -77,9 +77,13 @@ def _map_to_api_payload(hs_data):
 MIN_WORD_COUNT  = 900
 MIN_H2_COUNT    = 4
 MIN_SECTIONS    = 5
-MIN_IMAGES      = 3
-# MAX_IMAGES accounts for 3 CTA images + up to 5 section images (≤10 article sections)
-MAX_IMAGES      = 8
+MIN_IMAGES      = 0    # Images are optional: AI generation may be unavailable
+MAX_IMAGES      = 8    # 3 CTA + up to 5 section images
+
+# Old static catalog IDs that must never appear in published posts
+_BLOCKED_IMAGE_IDS = frozenset({"4483610", "4481326", "4481259"})
+# Trusted CDN: only HubSpot Files (AI-generated). Pexels URLs are blocked.
+_TRUSTED_CDN = "hubspotusercontent.com"
 
 
 def validate_post_package(hs_data):
@@ -139,25 +143,62 @@ def validate_post_package(hs_data):
             f"Article may be missing sections or blog_article field is empty/a URL."
         )
 
-    # ── Images ────────────────────────────────────────────────────────────────
-    # Match both Pexels CDN and HubSpot Files CDN (for AI-generated images)
-    _TRUSTED_CDN = ("images.pexels.com", "hubspotusercontent.com")
-    img_urls   = re.findall(
-        r'src="(https://(?:[^"]+pexels[^"]+|[^"]+hubspotusercontent[^"]+))"',
-        body,
-    )
-    img_ids    = [m.group(1) for m in (re.search(r'/photos/(\d+)/', u) for u in img_urls) if m]
-    id_counts  = Counter(img_ids)
-    duplicates = [id_ for id_, n in id_counts.items() if n > 1]
-    # Allow both Pexels CDN (stock photos) and HubSpot Files CDN (AI-generated).
-    untrusted  = [u for u in img_urls if not any(cdn in u for cdn in _TRUSTED_CDN)]
+    # ── Images — AI-only enforcement ─────────────────────────────────────────
+    # Only HubSpot-hosted AI images are accepted. Pexels and old static catalog
+    # IDs are explicitly blocked. Articles without images publish fine (MIN=0).
+    import logging as _imglog
+    _il = _imglog.getLogger("hubspot_api")
 
-    if duplicates:
-        errors.append(f"Duplicate image IDs: {duplicates}")
+    # Collect ALL <img src="..."> URLs from postBody
+    all_img_urls = re.findall(r'<img[^>]+src="(https://[^"]+)"', body)
+
+    # 1. Block any Pexels URL
+    pexels_urls = [u for u in all_img_urls if "pexels.com" in u]
+    for u in pexels_urls:
+        _il.warning(f"[IMAGE_VALIDATION_BLOCKED] Pexels URL rejected: {u[:80]}")
+
+    # 2. Block old static catalog IDs (4483610, 4481326, 4481259)
+    blocked_id_urls = [
+        u for u in all_img_urls
+        if any(bid in u for bid in _BLOCKED_IMAGE_IDS)
+    ]
+    for u in blocked_id_urls:
+        _il.warning(f"[IMAGE_VALIDATION_BLOCKED] Old catalog ID rejected: {u[:80]}")
+
+    # 3. Only trust hubspotusercontent.com
+    img_urls  = [u for u in all_img_urls if _TRUSTED_CDN in u]
+    untrusted = [u for u in all_img_urls if _TRUSTED_CDN not in u]
+    for u in untrusted:
+        _il.warning(f"[IMAGE_VALIDATION_BLOCKED] Non-HubSpot CDN rejected: {u[:80]}")
+
+    img_ids   = []   # AI images don't have numeric Pexels IDs — skip ID dedup
+    duplicates = [u for u, n in Counter(img_urls).items() if n > 1]
+
+    if pexels_urls:
+        errors.append(
+            f"Pexels images must not appear in published posts "
+            f"(set OPENAI_API_KEY for AI generation): {pexels_urls[:2]}"
+        )
+    if blocked_id_urls:
+        errors.append(
+            f"Old static catalog image IDs detected — these must be removed: "
+            f"{[u[:60] for u in blocked_id_urls[:2]]}"
+        )
     if untrusted:
         errors.append(
-            f"Images from untrusted sources "
-            f"(must be images.pexels.com or hubspotusercontent.com): {untrusted}"
+            f"Non-HubSpot images detected (must be hubspotusercontent.com): "
+            f"{[u[:60] for u in untrusted[:2]]}"
+        )
+    if duplicates:
+        errors.append(f"Duplicate image URLs: {[u[:60] for u in duplicates]}")
+    # MIN_IMAGES=0: articles with no images publish fine (AI unavailable)
+    if len(img_urls) > MAX_IMAGES:
+        errors.append(f"{len(img_urls)} images — maximum is {MAX_IMAGES}")
+
+    if not errors:
+        _il.info(
+            f"[IMAGE_VALIDATION_PASS] {len(img_urls)} AI image(s) validated  "
+            f"all_from=hubspotusercontent.com"
         )
     if len(img_urls) < MIN_IMAGES:
         errors.append(f"Only {len(img_urls)} image(s) — minimum is {MIN_IMAGES}")
@@ -205,9 +246,11 @@ def validate_post_package(hs_data):
         "word_count":               word_count,
         "h2_count":                 h2_count,
         "text_sections":            text_sections,
-        "image_count":              len(img_urls),
-        "unique_image_count":       len(set(img_urls)),
+        "ai_image_count":           len(img_urls),
+        "unique_ai_images":         len(set(img_urls)),
         "duplicate_images":         duplicates or "none",
+        "blocked_pexels_urls":      pexels_urls or "none",
+        "blocked_catalog_ids":      [u[:60] for u in blocked_id_urls] or "none",
         "untrusted_image_sources":  untrusted or "none",
         "cta_count":                cta_count,
         "cta_blocks_present":       cta_count == 3,

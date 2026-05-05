@@ -318,7 +318,7 @@ IMAGE_CATALOG: list = [
         quality_score=0.92,
         relevance_keywords=("warehouse", "fulfillment", "inventory", "storage", "fba", "amazon"),
         reusable_cta=True,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # AI-generated images only — static catalog fully retired
         roles=(ROLE_CTA,),
     ),
 
@@ -335,7 +335,7 @@ IMAGE_CATALOG: list = [
         quality_score=0.90,
         relevance_keywords=("warehouse", "pallets", "organized", "inventory", "fba", "amazon"),
         reusable_cta=True,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # AI-generated images only — static catalog fully retired
         roles=(ROLE_CTA,),
     ),
 
@@ -352,7 +352,7 @@ IMAGE_CATALOG: list = [
         quality_score=0.88,
         relevance_keywords=("warehouse", "pallets", "team", "fulfillment", "fba", "amazon"),
         reusable_cta=True,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # AI-generated images only — static catalog fully retired
         roles=(ROLE_CTA,),
     ),
 
