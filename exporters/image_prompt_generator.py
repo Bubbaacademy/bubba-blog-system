@@ -1,30 +1,29 @@
 """
-image_prompt_generator.py — Generate precise DALL-E 3 image prompts from article context.
+image_prompt_generator.py — Generate Replicate Flux image prompts from article context.
 
 WHY THIS EXISTS
 ---------------
-Stock photo APIs (Pexels, Unsplash) return "ecommerce" or "Amazon" images that are
-dominated by warehouse/fulfillment center photography — even for articles about PPC,
-AI tools, or product research. The visual category "Amazon seller" on stock sites =
-warehouse, which is wrong for 80% of our content.
+Stock photo APIs return "ecommerce" / "Amazon" images dominated by warehouse
+photography — even for articles about PPC, AI tools, or product research.
 
-AI generation solves this by letting us specify exactly what to show AND what to exclude.
-DALL-E 3 follows prompt instructions reliably when exclusions are embedded in the prompt.
+AI generation solves this: we specify exactly what to show AND what to exclude.
+Replicate's Flux models follow concise, descriptive prompts reliably.
 
 PROMPT FORMULA (per slot)
 --------------------------
-  [quality_prefix] + [specific_visual_subject] + [topic_context] + [style_guide] + [exclusions]
+  [quality_prefix] + [specific_visual_subject] + [topic_base] + [exclusions]
+
+Flux prompt guidelines:
+  - 200–500 chars is ideal (shorter than DALL-E)
+  - Clear subject first, style/exclusions last
+  - Negative terms embedded inline ("NOT a warehouse")
+  - No DALL-E-specific style flags needed (natural/vivid, etc.)
 
 Every prompt is:
-  - topic-category specific (different base for PPC vs AI vs FBA vs product research)
-  - section-heading specific (the heading drives the specific subject)
-  - article-keyword specific (for additional context)
-  - complete: no implicit fallbacks, exclusions baked in
-
-REUSE
------
-Change TOPIC_VISUAL_BASES to match any other vertical.
-UNIVERSAL_EXCLUSIONS and STYLE_SUFFIX are project-agnostic.
+  - topic-category specific (12 topic categories)
+  - section-heading specific for section images
+  - article-title specific for hero images
+  - complete: exclusions baked in, no implicit fallbacks
 """
 from __future__ import annotations
 
@@ -44,128 +43,72 @@ from exporters.image_policy import (
 
 log = logging.getLogger("image_prompt_generator")
 
-# ── Prompt constants ───────────────────────────────────────────────────────────
+# ── Style suffix — appended to every prompt ───────────────────────────────────
 
 STYLE_SUFFIX = (
-    "Photography style: professional editorial, clean composition, sharp focus, "
-    "modern corporate aesthetic, warm neutral tones or cool blue-tones depending on topic, "
-    "no people unless clearly contextually relevant and professional, "
-    "no text overlays, no watermarks, no stock-photo clichés. "
-    "Ultra-realistic, 16:9 landscape format, high resolution."
+    "Professional editorial photo, sharp focus, clean modern composition, "
+    "16:9 landscape, high resolution, no text, no watermarks, no logos."
 )
 
+# ── Universal exclusions — baked into every prompt ────────────────────────────
+
 UNIVERSAL_EXCLUSIONS = (
-    "EXCLUDE: no text, no words, no letters, no numbers overlay, no logos, "
-    "no brand names, no Amazon logo, no Amazon branding, "
-    "no food, no cooking, no kitchen, no restaurant, no meals, "
-    "no animals, no pets, no children, no casual lifestyle, "
-    "no beach, no vacation, no nature landscapes, "
-    "no abstract art, no illustration, no cartoon, no graphic design, "
-    "no gym, no fitness, no medical, no healthcare, "
-    "no distorted faces, no AI-artifact hands, "
-    "no generic stock photo clichés (no handshakes, no fake smiling)."
+    "No text overlays, no brand logos, no food, no animals, no children, "
+    "no beach, no gym, no cartoon, no illustration, no distorted faces."
 )
 
 # ── Per-topic visual base descriptions ────────────────────────────────────────
-# These describe what kind of imagery is APPROPRIATE for each topic category.
+# Short, direct descriptions of what imagery is APPROPRIATE for each topic.
 # Section heading + keyword are layered on top of these bases.
 
 TOPIC_VISUAL_BASES: dict = {
     CAT_AMAZON_ADS: (
-        "A professional business analytics workspace showing digital advertising "
-        "campaign performance. Clean monitor displays with charts, graphs, "
-        "performance metrics. Modern office environment with warm desk lighting. "
-        "Focus: digital marketing analytics, campaign optimization dashboard. "
-        "NOT a warehouse. NOT shipping boxes. NOT products on shelves. "
-        "This is a digital marketing topic."
+        "Business analytics workspace, digital advertising dashboard on monitor, "
+        "marketing performance charts, modern office, NOT a warehouse, NOT shipping boxes."
     ),
     CAT_AI_TOOLS: (
-        "A futuristic but grounded technology workspace showing AI-powered business software. "
-        "Clean laptop or monitor displaying data analytics interface with clean UI. "
-        "Subtle blue-white ambient lighting suggesting technology. "
-        "Modern professional workspace or server room concept. "
-        "Focus: artificial intelligence, automation, business technology tools. "
-        "NOT a warehouse. NOT shipping. NOT physical products on shelves. "
-        "This is a technology and software topic."
+        "AI software interface on laptop screen, futuristic technology workspace, "
+        "data visualization blue ambient lighting, NOT a warehouse, NOT shipping."
     ),
     CAT_FBA_LOGISTICS: (
-        "A modern Amazon fulfillment center or professional logistics warehouse. "
-        "Organized shelving racks with packages, clean operations floor, "
-        "professional workers managing inventory. "
-        "Focus: ecommerce fulfillment, warehouse operations, shipping logistics. "
-        "Appropriate: warehouse, shelves, boxes, packages, logistics."
+        "Modern Amazon fulfillment center, organized warehouse shelving with packages, "
+        "professional logistics workers, clean operations floor."
     ),
     CAT_PRODUCT_RESEARCH: (
-        "A professional business analyst or entrepreneur at a clean modern desk, "
-        "reviewing product research data on a laptop or multiple monitors. "
-        "Screen shows charts, market data, product comparisons. "
-        "Focus: product analysis, data-driven research, business strategy. "
-        "NOT a warehouse. NOT shipping boxes. NOT warehouse shelving. "
-        "This is a data analysis and research topic."
+        "Business analyst reviewing product data on multiple monitors, "
+        "market research charts on screen, professional desk, NOT a warehouse."
     ),
     CAT_SOURCING: (
-        "A modern manufacturing facility or professional supply chain operation. "
-        "Clean factory floor, quality control inspection, or supplier meeting. "
-        "Professional industrial environment. "
-        "Focus: manufacturing, sourcing, quality control, supply chain. "
-        "NOT warehouse shelving. NOT Amazon packaging. "
-        "This is a manufacturing and supplier topic."
+        "Clean manufacturing facility, quality control inspection, "
+        "supplier meeting in professional industrial environment, NOT Amazon packaging."
     ),
     CAT_LISTING_OPTIMIZATION: (
-        "A clean professional product photography studio setup or ecommerce listing "
-        "displayed on a laptop screen. Product spotlight lighting, clean white background, "
-        "or ecommerce interface on screen. "
-        "Focus: product presentation, listing quality, visual optimization. "
-        "NOT a warehouse. NOT shipping. "
-        "This is a product listing and photography topic."
+        "Product photography studio with spotlight lighting, "
+        "ecommerce listing on laptop screen, clean white background, NOT a warehouse."
     ),
     CAT_ECOM_STRATEGY: (
-        "A professional entrepreneur or business strategist at a modern workspace, "
-        "reviewing growth charts or business plans. Clean desk, laptop, "
-        "business charts on screen or whiteboard. "
-        "Focus: business strategy, revenue growth, planning, entrepreneurship. "
-        "NOT a warehouse. NOT shipping boxes. "
-        "This is a business strategy topic."
+        "Entrepreneur at modern desk reviewing growth charts and business plans, "
+        "laptop with business dashboard, NOT a warehouse, NOT shipping boxes."
     ),
     CAT_BRAND_BUILDING: (
-        "A professional brand design or marketing strategy session. "
-        "Brand mood board, color palette swatches, packaging design samples, "
-        "or marketing materials laid out professionally. "
-        "Focus: brand identity, design, marketing, business branding. "
-        "NOT a warehouse. NOT logistics. "
-        "This is a brand and marketing topic."
+        "Brand design session, color palette swatches, packaging design samples, "
+        "marketing materials on professional desk, NOT a warehouse."
     ),
     CAT_AMAZON_COMPLIANCE: (
-        "A professional business compliance or legal review setting. "
-        "Clean desk with documents, laptop showing policy dashboard, "
-        "professional business environment suggesting review and compliance. "
-        "Focus: business policy, account management, professional review. "
-        "NOT a warehouse. NOT food. "
-        "This is a business compliance topic."
+        "Professional compliance review setting, clean desk with documents, "
+        "laptop showing policy dashboard, business environment, NOT a warehouse."
     ),
     CAT_PRIVATE_LABEL: (
-        "Custom product packaging and branding materials in a professional studio. "
-        "Clean product boxes with modern branding, label design samples, "
-        "private label product close-up with clean background. "
-        "Focus: custom branding, packaging design, product identity. "
-        "NOT a warehouse. NOT generic stock. "
-        "This is a private label branding topic."
+        "Custom product packaging in professional studio, "
+        "modern branding on product boxes, label design samples, clean background."
     ),
     CAT_AMAZON_FOUNDATION: (
-        "A motivated entrepreneur or small business owner at a clean modern home office, "
-        "working on a laptop with ecommerce seller interface visible on screen. "
-        "Professional but accessible setting suggesting starting an online business. "
-        "Focus: ecommerce entrepreneurship, starting a business, online selling basics. "
-        "NOT a warehouse unless the article specifically discusses logistics. "
-        "NOT food, NOT random lifestyle. "
-        "This is a beginner Amazon seller education topic."
+        "Motivated entrepreneur at home office, laptop with ecommerce seller interface, "
+        "professional accessible setting, NOT a warehouse, NOT food."
     ),
     CAT_GENERAL_BUSINESS: (
-        "A clean professional business workspace or meeting environment. "
-        "Modern office, laptop with business dashboard, or professional team collaboration. "
-        "Focus: business strategy, professional work environment, growth mindset. "
-        "NOT food, NOT warehouse, NOT lifestyle. "
-        "This is a general professional business topic."
+        "Clean professional business workspace, laptop with analytics dashboard, "
+        "modern office environment, NOT food, NOT warehouse, NOT lifestyle."
     ),
 }
 
@@ -177,15 +120,14 @@ TOPIC_VISUAL_BASES: dict = {
 @dataclass
 class ImagePrompt:
     """
-    A fully constructed image generation prompt.
+    A fully constructed Replicate Flux image prompt.
 
     Fields
     ------
-    text          Full prompt text sent to DALL-E 3 (or used as Pexels query)
+    text           Full prompt text sent to Replicate (concise, ≤1500 chars)
     topic_category Topic category this prompt was built for
-    slot          "hero" | "section_0" | "section_1" | "cta_0" etc.
-    basis         Human-readable explanation of what drove the prompt (for logging)
-    prompt_hash   SHA-256 of text[:8] prefix — used as registry image_id for AI images
+    slot           "hero" | "section_0" | "section_1" | "cta_0" etc.
+    basis          Human-readable explanation of what drove the prompt (logging)
     """
     text:           str
     topic_category: str
@@ -198,11 +140,7 @@ class ImagePrompt:
 
     @property
     def pexels_query(self) -> str:
-        """
-        Condensed version of the prompt suitable as a Pexels search query.
-        Takes the first meaningful noun phrase from the prompt.
-        """
-        # Extract meaningful words from the first sentence of the topic base
+        """Condensed version of the prompt (kept for backward compatibility)."""
         first_sentence = self.text.split(".")[0]
         words = re.sub(r"[^a-z0-9\s]", " ", first_sentence.lower()).split()
         meaningful = [w for w in words if w not in STOPWORDS and len(w) > 3]
@@ -214,10 +152,10 @@ class ImagePrompt:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_heading_concepts(heading: str) -> str:
-    """Extract 4–6 key concept words from a section heading."""
+    """Extract 3–5 key concept words from a section heading."""
     clean = re.sub(r"[^a-z0-9\s]", " ", heading.lower())
     words = [w for w in clean.split() if w not in STOPWORDS and len(w) > 3]
-    return " ".join(words[:6]) if words else ""
+    return " ".join(words[:5]) if words else ""
 
 
 def generate_prompt(
@@ -229,7 +167,7 @@ def generate_prompt(
     article_title: str = "",
 ) -> ImagePrompt:
     """
-    Generate a complete DALL-E 3 image prompt for a single image slot.
+    Generate a complete Replicate Flux image prompt for a single image slot.
 
     Parameters
     ----------
@@ -237,12 +175,12 @@ def generate_prompt(
     keyword          : article main keyword
     topic_category   : routing category (e.g. "amazon_ads_digital")
     section_heading  : section heading text (for section images)
-    paragraph_snippet: first ~200 chars of the section paragraph (for context)
+    paragraph_snippet: first ~200 chars of the section paragraph (optional context)
     article_title    : article title (for hero images)
 
     Returns
     -------
-    ImagePrompt with fully constructed text ready for DALL-E 3
+    ImagePrompt with concise text ready for Replicate Flux models
     """
     topic_base = TOPIC_VISUAL_BASES.get(
         topic_category,
@@ -250,55 +188,45 @@ def generate_prompt(
     )
 
     if role == "hero":
-        # Hero: article-level visual, based on title + keyword
         heading_concepts = _extract_heading_concepts(article_title or keyword)
-        slot = "hero"
+        slot  = "hero"
         basis = f"article_title='{(article_title or keyword)[:60]}'"
         specific = (
-            f"The primary hero image for a business blog article titled: '{article_title or keyword}'. "
-            f"Key concepts to visualize: {heading_concepts}. "
+            f"Hero image for article: '{(article_title or keyword)[:80]}'. "
+            f"Key concepts: {heading_concepts}. "
         ) if heading_concepts else ""
 
     elif role == "section":
-        # Section: heading-specific visual
         heading_concepts = _extract_heading_concepts(section_heading)
-        slot = f"section_{section_heading[:30]}"
+        slot  = f"section_{section_heading[:30]}"
         basis = f"heading='{section_heading[:60]}'"
 
-        # Extract additional context from paragraph snippet if provided
         para_hint = ""
         if paragraph_snippet:
-            para_words = re.sub(r"[^a-z0-9\s]", " ", paragraph_snippet.lower()).split()
+            para_words   = re.sub(r"[^a-z0-9\s]", " ", paragraph_snippet.lower()).split()
             para_concepts = [w for w in para_words if w not in STOPWORDS and len(w) > 4]
             if para_concepts:
-                para_hint = f"Additional context from article section: {' '.join(para_concepts[:8])}. "
+                para_hint = f"Context: {' '.join(para_concepts[:6])}. "
 
         specific = (
-            f"An image illustrating the concept: '{section_heading}'. "
-            f"Key visual concepts: {heading_concepts}. "
+            f"Illustrating concept: '{section_heading[:80]}'. "
+            f"Visual focus: {heading_concepts}. "
             f"{para_hint}"
-        ) if heading_concepts else f"An image illustrating: '{section_heading}'. "
+        ) if heading_concepts else f"Illustrating: '{section_heading[:80]}'. "
 
     else:
         # CTA or unknown: generic topic-level image
-        slot = f"cta_{role}"
-        basis = f"topic={topic_category}"
+        slot     = f"cta_{role}"
+        basis    = f"topic={topic_category}"
         specific = ""
 
-    # Compose final prompt
-    quality_prefix = (
-        "Professional editorial business photography, ultra-realistic, "
-        "16:9 landscape, high-quality stock photo alternative. "
-    )
-
+    # Compose final prompt — concise for Flux (target 200–450 chars)
     full_prompt = (
-        f"{quality_prefix}"
         f"{specific}"
-        f"Topic category: {topic_category.replace('_', ' ')}. "
         f"{topic_base} "
         f"{STYLE_SUFFIX} "
         f"{UNIVERSAL_EXCLUSIONS}"
-    )
+    ).strip()
 
     log.info(
         f"[AI_IMAGE_PROMPT] slot={slot}  "

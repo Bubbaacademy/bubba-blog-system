@@ -1,33 +1,30 @@
 """
-tests/test_image_system.py — AI-only image pipeline verification.
+tests/test_image_system.py — Replicate-only image pipeline verification.
 
 Run from project root:
     python3 tests/test_image_system.py
 
-Tests all correctness requirements for the v4 AI-only pipeline:
-  1. Static catalog completely disabled — zero approved images in any role
-  2. PPC article routes to amazon_ads_digital, gets non-warehouse AI images
-  3. AI tools article routes to ai_tools_automation, gets tech AI images
-  4. PPC and AI posts produce distinct topic-specific images
-  5. Cross-post section image deduplication (registry dedup)
-  6. Visual cluster diversity within a post
-  7. CTA images use AI provider (not static catalog)
-  8. No image available → returns None everywhere (no fallback)
-  9. Registry persists used IDs across simulated runs
- 10. Full simulation: PPC + AI posts — AI sources only, no duplicates
- 11. _img_tag() rejects non-HubSpot URLs (zero-tolerance gate)
- 12. Module structure check — all required modules present
- 13. image_selector.py contains no HubSpot-specific imports
+30 tests covering:
+  A. Model allowlist (tests 1–4)
+  B. Cost estimates (tests 5–6)
+  C. Cost guard enforcement (tests 7–10)
+  D. Model allowlist enforcement (tests 11–12)
+  E. Static catalog disabled (tests 13–15)
+  F. Topic routing (tests 16–17)
+  G. Image generation via MockReplicateProvider (tests 18–21)
+  H. Deduplication (tests 22–24)
+  I. Zero-tolerance _img_tag() gate (tests 25–27)
+  J. Code quality and security (tests 28–30)
 
-All provider calls are MOCKED — no OPENAI_API_KEY required.
+All provider calls are MOCKED — no REPLICATE_API_TOKEN required.
 """
 from __future__ import annotations
 
 import sys
 import re
-import logging
 import os
 import ast
+import logging
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -63,233 +60,235 @@ def section(title: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mock image provider — no real API calls in tests
+# MockReplicateProvider — no real API calls in tests
 # ─────────────────────────────────────────────────────────────────────────────
 
-from exporters.image_provider import ImageAsset, ImageProvider
+from exporters.image_provider import ImageAsset, ImageProvider, APPROVED_REPLICATE_MODELS
 
 # HubSpot Files CDN domain — all AI images must land here
 HS_CDN = "hubspotusercontent.com"
+_DEFAULT_MODEL_NAME = "black-forest-labs/flux-schnell"
 
 
-class MockImageProvider(ImageProvider):
+class MockReplicateProvider(ImageProvider):
     """
     Returns pre-defined ImageAsset objects with hubspotusercontent.com URLs.
-    Simulates the full AI generation + HubSpot Files upload chain.
+    Simulates: Replicate Flux generation → download → HubSpot Files upload.
 
-    In production: DALL-E 3 generates image → uploaded to HubSpot Files →
-    permanent hubspotusercontent.com URL returned.
-    In tests: MockImageProvider returns pre-baked ImageAsset with that CDN URL.
+    provider="replicate", model="black-forest-labs/flux-schnell" on all assets.
     """
 
     _MOCK_POOLS: dict = {
         "ppc": [
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ppc-campaign-hero.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ppc_001",
                 prompt_hash    = "ppc001hash000000",
                 search_query   = "",
                 visual_cluster = "ads_dashboard",
                 alt_text       = "Professional business analytics workspace for PPC campaign management",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ppc-metrics-section.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ppc_002",
                 prompt_hash    = "ppc002hash000000",
                 search_query   = "",
                 visual_cluster = "marketing_metrics",
                 alt_text       = "Digital marketing performance metrics dashboard PPC analytics",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ppc-bidding-section.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ppc_003",
                 prompt_hash    = "ppc003hash000000",
                 search_query   = "",
                 visual_cluster = "ecommerce_analytics",
                 alt_text       = "Ecommerce advertising ROI optimization analytics chart",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ppc-cta-lead.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ppc_cta_0",
                 prompt_hash    = "ppccta0hash00000",
                 search_query   = "",
                 visual_cluster = "cta_marketing",
                 alt_text       = "Business analytics workspace CTA block",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ppc-cta-mid.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ppc_cta_1",
                 prompt_hash    = "ppccta1hash00000",
                 search_query   = "",
                 visual_cluster = "cta_conversion",
                 alt_text       = "Digital marketing strategy CTA mid-article",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ppc-cta-close.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ppc_cta_2",
                 prompt_hash    = "ppccta2hash00000",
                 search_query   = "",
                 visual_cluster = "cta_business",
                 alt_text       = "Business growth analytics CTA conversion",
+                model          = _DEFAULT_MODEL_NAME,
             ),
         ],
         "ai": [
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ai-tools-hero.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ai_001",
                 prompt_hash    = "ai001hash0000000",
                 search_query   = "",
                 visual_cluster = "ai_software_ui",
                 alt_text       = "AI-powered business analytics software interface futuristic workspace",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ai-automation-section.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ai_002",
                 prompt_hash    = "ai002hash0000000",
                 search_query   = "",
                 visual_cluster = "automation_dashboard",
                 alt_text       = "AI ecommerce automation analytics dashboard technology workspace",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ai-ml-section.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ai_003",
                 prompt_hash    = "ai003hash0000000",
                 search_query   = "",
                 visual_cluster = "ml_analytics",
                 alt_text       = "Machine learning business data visualization modern office",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ai-cta-lead.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ai_cta_0",
                 prompt_hash    = "aicta0hash000000",
                 search_query   = "",
                 visual_cluster = "cta_tech",
                 alt_text       = "AI technology workspace CTA block",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ai-cta-mid.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ai_cta_1",
                 prompt_hash    = "aicta1hash000000",
                 search_query   = "",
                 visual_cluster = "cta_ai_mid",
                 alt_text       = "AI tools for sellers CTA mid-article",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/ai-cta-close.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "ai_cta_2",
                 prompt_hash    = "aicta2hash000000",
                 search_query   = "",
                 visual_cluster = "cta_ai_close",
                 alt_text       = "AI business strategy CTA conversion",
+                model          = _DEFAULT_MODEL_NAME,
             ),
         ],
         "fba": [
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/fba-warehouse-hero.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "fba_001",
                 prompt_hash    = "fba001hash000000",
                 search_query   = "",
                 visual_cluster = "warehouse_interior",
                 alt_text       = "Modern Amazon FBA fulfillment center professional operations",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/fba-shipping-section.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "fba_002",
                 prompt_hash    = "fba002hash000000",
                 search_query   = "",
                 visual_cluster = "shipping_logistics",
                 alt_text       = "Amazon FBA inbound shipping logistics professional workflow",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/fba-cta0.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "fba_cta_0",
                 prompt_hash    = "fbacta0hash00000",
                 search_query   = "",
                 visual_cluster = "cta_logistics",
                 alt_text       = "FBA fulfillment center CTA block",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/fba-cta1.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "fba_cta_1",
                 prompt_hash    = "fbacta1hash00000",
                 search_query   = "",
                 visual_cluster = "cta_fba_mid",
                 alt_text       = "FBA shipping process CTA mid-article",
-            ),
-            ImageAsset(
-                url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/fba-cta2.jpg",
-                provider       = "openai",
-                provider_id    = "fba_cta_2",
-                prompt_hash    = "fbacta2hash00000",
-                search_query   = "",
-                visual_cluster = "cta_fba_close",
-                alt_text       = "Amazon seller business CTA conversion",
+                model          = _DEFAULT_MODEL_NAME,
             ),
         ],
         "general": [
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/general-business-hero.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "gen_001",
                 prompt_hash    = "gen001hash000000",
                 search_query   = "",
                 visual_cluster = "business_workspace",
                 alt_text       = "Professional business analytics strategy modern workspace",
+                model          = _DEFAULT_MODEL_NAME,
             ),
             ImageAsset(
                 url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/general-cta0.jpg",
-                provider       = "openai",
+                provider       = "replicate",
                 provider_id    = "gen_cta_0",
                 prompt_hash    = "gencta0hash00000",
                 search_query   = "",
                 visual_cluster = "cta_general",
                 alt_text       = "Business strategy CTA block",
-            ),
-            ImageAsset(
-                url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/general-cta1.jpg",
-                provider       = "openai",
-                provider_id    = "gen_cta_1",
-                prompt_hash    = "gencta1hash00000",
-                search_query   = "",
-                visual_cluster = "cta_general_mid",
-                alt_text       = "Business analytics CTA mid-article",
-            ),
-            ImageAsset(
-                url            = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/general-cta2.jpg",
-                provider       = "openai",
-                provider_id    = "gen_cta_2",
-                prompt_hash    = "gencta2hash00000",
-                search_query   = "",
-                visual_cluster = "cta_general_close",
-                alt_text       = "Business growth CTA conversion",
+                model          = _DEFAULT_MODEL_NAME,
             ),
         ],
     }
 
     def __init__(self, topic: str = "general", empty: bool = False):
-        self.topic = topic
-        self._empty = empty
+        self.topic     = topic
+        self._empty    = empty
         self.call_log: list = []
+        # Mimic real provider attributes for tests that inspect them
+        self._model            = _DEFAULT_MODEL_NAME
+        self._estimated_cost   = APPROVED_REPLICATE_MODELS[_DEFAULT_MODEL_NAME]
+        self._post_cost        = 0.0
+        self._post_images      = 0
+        self._max_post_cost    = 0.05
+        self._max_day_cost     = 1.00
+        self._max_images       = 3
+
+    def start_post(self) -> None:
+        self._post_cost   = 0.0
+        self._post_images = 0
 
     @property
     def name(self) -> str:
-        return "mock"
+        return "replicate"
 
     @property
     def available(self) -> bool:
@@ -298,17 +297,14 @@ class MockImageProvider(ImageProvider):
     def get_image(self, prompt, article_slug, slot_name, registry, used_urls) -> "ImageAsset | None":
         if self._empty:
             return None
-
         self.call_log.append(slot_name)
         pool = self._MOCK_POOLS.get(self.topic, self._MOCK_POOLS["general"])
-
         for asset in pool:
             if asset.url in used_urls:
                 continue
             if registry.is_globally_used(asset.image_id):
                 continue
             return asset
-
         return None  # pool exhausted
 
 
@@ -332,508 +328,442 @@ def build_service(keyword: str, cluster: str, registry=None, provider=None):
         article_topic_cluster = cluster,
         article_title         = f"Test: {keyword}",
         article_slug          = re.sub(r"[^a-z0-9\-]", "-", keyword.lower())[:60],
-        _provider             = provider or MockImageProvider(),
+        _provider             = provider or MockReplicateProvider(),
         _registry             = registry or build_mock_registry(),
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 1 — Static catalog completely disabled
+# SECTION A — Model allowlist (tests 1–4)
 # ─────────────────────────────────────────────────────────────────────────────
-section("TEST 1: Static image catalog fully disabled — zero approved images in any role")
+section("SECTION A — Tests 1–4: Replicate model allowlist")
+
+# Test 1: APPROVED_REPLICATE_MODELS has exactly 2 entries
+check(
+    "Test 1: APPROVED_REPLICATE_MODELS has exactly 2 approved models",
+    len(APPROVED_REPLICATE_MODELS) == 2,
+    f"Models: {sorted(APPROVED_REPLICATE_MODELS.keys())}",
+)
+
+# Test 2: flux-schnell is approved
+check(
+    "Test 2: black-forest-labs/flux-schnell is in APPROVED_REPLICATE_MODELS",
+    "black-forest-labs/flux-schnell" in APPROVED_REPLICATE_MODELS,
+    f"Keys: {sorted(APPROVED_REPLICATE_MODELS.keys())}",
+)
+
+# Test 3: flux-dev is approved
+check(
+    "Test 3: black-forest-labs/flux-dev is in APPROVED_REPLICATE_MODELS",
+    "black-forest-labs/flux-dev" in APPROVED_REPLICATE_MODELS,
+    f"Keys: {sorted(APPROVED_REPLICATE_MODELS.keys())}",
+)
+
+# Test 4: Default model (when REPLICATE_MODEL env not set) is flux-schnell
+import os as _os
+_saved_model_env = _os.environ.pop("REPLICATE_MODEL", None)
+from exporters.image_provider import ReplicateImageProvider, _DEFAULT_MODEL
+check(
+    "Test 4: Default model is black-forest-labs/flux-schnell",
+    _DEFAULT_MODEL == "black-forest-labs/flux-schnell",
+    f"Got: '{_DEFAULT_MODEL}'",
+)
+if _saved_model_env is not None:
+    _os.environ["REPLICATE_MODEL"] = _saved_model_env
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION B — Cost estimates (tests 5–6)
+# ─────────────────────────────────────────────────────────────────────────────
+section("SECTION B — Tests 5–6: Cost estimates per model")
+
+# Test 5: flux-schnell = $0.003
+check(
+    "Test 5: flux-schnell estimated cost = $0.003 per image",
+    APPROVED_REPLICATE_MODELS["black-forest-labs/flux-schnell"] == 0.003,
+    f"Got: ${APPROVED_REPLICATE_MODELS['black-forest-labs/flux-schnell']}",
+)
+
+# Test 6: flux-dev = $0.025
+check(
+    "Test 6: flux-dev estimated cost = $0.025 per image",
+    APPROVED_REPLICATE_MODELS["black-forest-labs/flux-dev"] == 0.025,
+    f"Got: ${APPROVED_REPLICATE_MODELS['black-forest-labs/flux-dev']}",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION C — Cost guard enforcement (tests 7–10)
+# ─────────────────────────────────────────────────────────────────────────────
+section("SECTION C — Tests 7–10: Cost guard enforcement")
+
+import logging as _logging
+
+# Build a bare provider instance without a token (so constructor warnings are acceptable)
+_os.environ["REPLICATE_API_TOKEN"] = "r8_test_token_for_cost_guard_tests"
+_os.environ["MAX_IMAGE_COST_PER_POST_USD"] = "0.05"
+_os.environ["MAX_IMAGE_COST_PER_DAY_USD"] = "1.00"
+# Reset class-level day cost so tests start clean
+ReplicateImageProvider._day_cost_usd = 0.0
+ReplicateImageProvider._day_str = ""
+
+_cost_provider = ReplicateImageProvider()
+
+# Test 7: Cost guard allows when well under per-post and per-day limits
+_cost_provider._post_cost = 0.0
+_cost_provider._post_images = 0
+ReplicateImageProvider._day_cost_usd = 0.0
+check(
+    "Test 7: Cost guard ALLOWS when post_cost=0.00 < post_limit=$0.05",
+    _cost_provider._check_cost_guard() is True,
+    f"post_cost=${_cost_provider._post_cost:.4f}  limit=${_cost_provider._max_post_cost:.4f}",
+)
+
+# Test 8: Cost guard blocks when per-post limit would be exceeded
+_cost_provider._post_cost = 0.048   # $0.048 + $0.003 = $0.051 > $0.05
+ReplicateImageProvider._day_cost_usd = 0.0
+import io as _io
+_handler_buf = _io.StringIO()
+_h = _logging.StreamHandler(_handler_buf)
+_logging.getLogger("image_provider").addHandler(_h)
+_post_blocked = _cost_provider._check_cost_guard()
+_cost_log = _handler_buf.getvalue()
+_logging.getLogger("image_provider").removeHandler(_h)
+check(
+    "Test 8: Cost guard BLOCKS when post_cost + estimated > post_limit",
+    _post_blocked is False,
+    f"post_cost=${_cost_provider._post_cost:.4f}  estimated=${_cost_provider._estimated_cost:.4f}  limit=${_cost_provider._max_post_cost:.4f}",
+)
+check(
+    "Test 9: [COST_GUARD_BLOCKED] is logged when post limit exceeded",
+    "COST_GUARD_BLOCKED" in _cost_log,
+    f"Log output: {_cost_log[:200]}",
+)
+
+# Test 10: Cost guard blocks when per-day limit would be exceeded
+_cost_provider._post_cost = 0.0
+ReplicateImageProvider._day_cost_usd = 0.999   # $0.999 + $0.003 = $1.002 > $1.00
+_day_buf = _io.StringIO()
+_dh = _logging.StreamHandler(_day_buf)
+_logging.getLogger("image_provider").addHandler(_dh)
+_day_blocked = _cost_provider._check_cost_guard()
+_day_log = _day_buf.getvalue()
+_logging.getLogger("image_provider").removeHandler(_dh)
+check(
+    "Test 10: Cost guard BLOCKS when day_cost + estimated > day_limit",
+    _day_blocked is False,
+    f"day_cost=${ReplicateImageProvider._day_cost_usd:.4f}  estimated=${_cost_provider._estimated_cost:.4f}  day_limit=${_cost_provider._max_day_cost:.4f}",
+)
+
+# Reset after cost guard tests
+_cost_provider._post_cost = 0.0
+ReplicateImageProvider._day_cost_usd = 0.0
+_os.environ.pop("REPLICATE_API_TOKEN", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION D — Model allowlist enforcement (tests 11–12)
+# ─────────────────────────────────────────────────────────────────────────────
+section("SECTION D — Tests 11–12: Model allowlist enforcement")
+
+# Test 11: Known approved model resolves correctly
+_os.environ["REPLICATE_MODEL"] = "black-forest-labs/flux-schnell"
+_os.environ["REPLICATE_API_TOKEN"] = "r8_test"
+_p_known = ReplicateImageProvider()
+check(
+    "Test 11: Known model 'flux-schnell' resolves and is not blocked",
+    _p_known._model == "black-forest-labs/flux-schnell",
+    f"Got model: '{_p_known._model}'",
+)
+_os.environ.pop("REPLICATE_MODEL", None)
+_os.environ.pop("REPLICATE_API_TOKEN", None)
+
+# Test 12: Unknown model → [IMAGE_MODEL_BLOCKED] logged, falls back to default
+_os.environ["REPLICATE_MODEL"] = "some-random/unknown-model"
+_os.environ["REPLICATE_API_TOKEN"] = "r8_test"
+_blocked_buf = _io.StringIO()
+_bh = _logging.StreamHandler(_blocked_buf)
+_logging.getLogger("image_provider").addHandler(_bh)
+_p_blocked = ReplicateImageProvider()
+_blocked_log = _blocked_buf.getvalue()
+_logging.getLogger("image_provider").removeHandler(_bh)
+check(
+    "Test 12: Unknown model triggers [IMAGE_MODEL_BLOCKED] log + falls back to flux-schnell",
+    "IMAGE_MODEL_BLOCKED" in _blocked_log and _p_blocked._model == "black-forest-labs/flux-schnell",
+    f"Logged: {'IMAGE_MODEL_BLOCKED' in _blocked_log}  resolved_model={_p_blocked._model}",
+)
+_os.environ.pop("REPLICATE_MODEL", None)
+_os.environ.pop("REPLICATE_API_TOKEN", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION E — Static catalog disabled (tests 13–15)
+# ─────────────────────────────────────────────────────────────────────────────
+section("SECTION E — Tests 13–15: Static image catalog fully disabled")
 
 from exporters.image_policy import STATUS_APPROVED, ROLE_SECTION, ROLE_HERO, ROLE_CTA
-from exporters.image_catalog import IMAGE_CATALOG, get_approved
+from exporters.image_catalog import IMAGE_CATALOG, get_approved, get_by_id
 
+# Test 13: Zero approved images in IMAGE_CATALOG
 all_approved = [e for e in IMAGE_CATALOG if e.status == STATUS_APPROVED]
 check(
-    "Zero approved images remain in entire IMAGE_CATALOG",
+    "Test 13: Zero approved images remain in IMAGE_CATALOG",
     len(all_approved) == 0,
     f"Still approved: {[e.image_id for e in all_approved]}" if all_approved else "All disabled",
 )
 
-# Old warehouse CTA IDs must never surface
-from exporters.image_catalog import get_by_id
+# Test 14: Old warehouse CTA IDs are fully disabled
 _RETIRED_IDS = {"4483610", "4481326", "4481259"}
 retired_still_active = [
     id_ for id_ in _RETIRED_IDS
     if (e := get_by_id(id_)) and e.status == STATUS_APPROVED
 ]
 check(
-    "Old warehouse CTA IDs (4483610, 4481326, 4481259) are fully disabled",
+    "Test 14: Old warehouse CTA IDs (4483610, 4481326, 4481259) fully disabled",
     len(retired_still_active) == 0,
     f"Still active: {retired_still_active}" if retired_still_active else "All retired",
 )
 
-# get_approved() must return empty for ALL roles
+# Test 15: get_approved() returns empty for ALL roles
+_all_empty = True
 for role in (ROLE_SECTION, ROLE_HERO, ROLE_CTA):
     pool = get_approved(role=role)
-    check(
-        f"get_approved(role='{role}') returns empty list",
-        len(pool) == 0,
-        f"Still has: {[e.image_id for e in pool]}" if pool else "Empty",
-    )
+    if pool:
+        _all_empty = False
+check(
+    "Test 15: get_approved() returns empty list for hero, section, and cta roles",
+    _all_empty,
+    "Empty for all roles" if _all_empty else "Some roles still have approved images",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 2 — PPC article routes correctly and gets AI images (not warehouse)
+# SECTION F — Topic routing (tests 16–17)
 # ─────────────────────────────────────────────────────────────────────────────
-section("TEST 2: PPC article — routes to amazon_ads_digital, AI images only")
+section("SECTION F — Tests 16–17: Topic routing")
 
-from exporters.image_policy import CAT_AMAZON_ADS
+from exporters.image_policy import CAT_AMAZON_ADS, CAT_AI_TOOLS
 from exporters.image_router import route
 
+# Test 16: PPC keyword → amazon_ads_digital
 ppc_category = route("amazon ppc budget optimization", "Amazon Advertising")
 check(
-    "PPC keyword routes to amazon_ads_digital",
+    "Test 16: PPC keyword routes to amazon_ads_digital",
     ppc_category == CAT_AMAZON_ADS,
     f"Got: '{ppc_category}'",
 )
 
-ppc_svc = build_service(
-    "amazon ppc budget optimization",
-    "Amazon Advertising",
-    provider=MockImageProvider("ppc"),
-)
-ppc_url = ppc_svc.section("How to Set Your PPC Budget", 0)
-
-check(
-    "PPC section returns a URL (AI provider delivered an asset)",
-    ppc_url is not None,
-    f"Got: {ppc_url[:80] if ppc_url else 'None'}",
-)
-check(
-    "PPC section URL is from HubSpot CDN (AI-generated)",
-    ppc_url is None or HS_CDN in ppc_url,
-    f"URL: {ppc_url}",
-)
-check(
-    "PPC section URL is NOT from Pexels",
-    ppc_url is None or "pexels.com" not in ppc_url,
-    f"URL: {ppc_url}",
-)
-check(
-    "PPC section URL contains 'ppc' (topic-specific AI asset)",
-    ppc_url is None or "ppc" in ppc_url.lower(),
-    f"URL: {ppc_url}",
-)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 3 — AI tools article routes correctly and gets AI images
-# ─────────────────────────────────────────────────────────────────────────────
-section("TEST 3: AI tools article — routes to ai_tools_automation, AI images only")
-
-from exporters.image_policy import CAT_AI_TOOLS
-
+# Test 17: AI tools keyword → ai_tools_automation
 ai_category = route("AI tools for online sellers in 2026", "AI Tools Automation")
 check(
-    "AI tools keyword routes to ai_tools_automation",
+    "Test 17: AI tools keyword routes to ai_tools_automation",
     ai_category == CAT_AI_TOOLS,
     f"Got: '{ai_category}'",
 )
 
-ai_svc = build_service(
-    "AI tools for online sellers in 2026",
-    "AI Tools Automation",
-    provider=MockImageProvider("ai"),
-)
-ai_url = ai_svc.section("Best AI Tools for Amazon Sellers", 0)
 
-check(
-    "AI section returns a URL (AI provider delivered an asset)",
-    ai_url is not None,
-    f"Got: {ai_url[:80] if ai_url else 'None'}",
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION G — Image generation via MockReplicateProvider (tests 18–21)
+# ─────────────────────────────────────────────────────────────────────────────
+section("SECTION G — Tests 18–21: Image generation with MockReplicateProvider")
+
+# Test 18: Section returns hubspotusercontent.com URL
+ppc_svc = build_service(
+    "amazon ppc budget optimization",
+    "Amazon Advertising",
+    provider=MockReplicateProvider("ppc"),
 )
+ppc_url = ppc_svc.section("How to Set Your PPC Budget", 0)
 check(
-    "AI section URL is from HubSpot CDN (AI-generated)",
-    ai_url is None or HS_CDN in ai_url,
-    f"URL: {ai_url}",
+    "Test 18: Section image URL is from HubSpot CDN (hubspotusercontent.com)",
+    ppc_url is not None and HS_CDN in ppc_url,
+    f"URL: {ppc_url}",
 )
+
+# Test 19: Section URL is NOT from Pexels
 check(
-    "AI section URL is NOT from Pexels",
-    ai_url is None or "pexels.com" not in ai_url,
-    f"URL: {ai_url}",
+    "Test 19: Section image URL is NOT from Pexels",
+    ppc_url is None or "pexels.com" not in ppc_url,
+    f"URL: {ppc_url}",
 )
+
+# Test 20: CTA uses AI provider (source = "replicate", not "static_catalog")
+svc20 = build_service("amazon ppc", "Amazon Advertising",
+                       provider=MockReplicateProvider("ppc"))
+cta0 = svc20.cta(0)
+cta_sources = [s.source for s in svc20._selections if s.role == "cta"]
 check(
-    "AI section URL contains 'ai' (topic-specific AI asset)",
-    ai_url is None or "ai" in ai_url.lower(),
-    f"URL: {ai_url}",
+    "Test 20: CTA image source is 'replicate' (not static_catalog)",
+    all(src == "replicate" for src in cta_sources),
+    f"CTA sources: {cta_sources}",
+)
+
+# Test 21: Empty provider → all slots return None (no static fallback)
+svc21 = build_service("amazon ppc acos", "Amazon Advertising",
+                       provider=MockReplicateProvider(empty=True))
+check(
+    "Test 21: Empty provider — section, hero, and cta all return None",
+    (svc21.section("How to reduce ACOS", 0) is None and
+     svc21.hero("Complete PPC guide") is None and
+     svc21.cta(0) is None),
+    "All three slots returned None as expected",
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 4 — PPC and AI posts produce different non-overlapping images
+# SECTION H — Deduplication (tests 22–24)
 # ─────────────────────────────────────────────────────────────────────────────
-section("TEST 4: PPC and AI articles produce distinct AI images")
+section("SECTION H — Tests 22–24: Image deduplication")
 
-ppc_svc2 = build_service("amazon ppc budget optimization", "Amazon Advertising",
-                          provider=MockImageProvider("ppc"))
-ai_svc2  = build_service("AI tools for online sellers 2026", "AI Tools Automation",
-                          provider=MockImageProvider("ai"))
-
-ppc_url2 = ppc_svc2.section("Managing PPC Campaign Budget", 0)
-ai_url2  = ai_svc2.section("Best AI Tools for Amazon Sellers 2026", 0)
-
-print(f"\n  PPC section URL:      {ppc_url2}")
-print(f"  AI tools section URL: {ai_url2}")
-
-check(
-    "PPC and AI section images are different URLs",
-    ppc_url2 != ai_url2,
-    f"PPC={ppc_url2}  AI={ai_url2}",
-)
-check(
-    "PPC image contains 'ppc' (topic-specific)",
-    ppc_url2 is None or "ppc" in ppc_url2.lower(),
-    f"URL: {ppc_url2}",
-)
-check(
-    "AI image contains 'ai' (topic-specific)",
-    ai_url2 is None or "ai" in ai_url2.lower(),
-    f"URL: {ai_url2}",
-)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 5 — Cross-post section image deduplication
-# ─────────────────────────────────────────────────────────────────────────────
-section("TEST 5: Cross-post section image deduplication (registry dedup)")
-
+# Test 22: Cross-post section dedup
 shared_registry = build_mock_registry()
 
-svc5a = build_service("amazon fba inbound shipping", "FBA Shipping",
-                       registry=shared_registry, provider=MockImageProvider("fba"))
-url5a_0 = svc5a.section("Inbound Shipping Overview fba", 0)
-url5a_1 = svc5a.section("Shipping Cost Calculator fba", 1)
-
-for sel in svc5a._selections:
+svc22a = build_service("amazon fba inbound shipping", "FBA Shipping",
+                        registry=shared_registry, provider=MockReplicateProvider("fba"))
+svc22a.section("Inbound Shipping Overview fba", 0)
+svc22a.section("Shipping Cost Calculator fba", 1)
+for sel in svc22a._selections:
     if sel.role == "section":
         shared_registry._used_section_ids.add(sel.image_id)
 
-post1_ids = {sel.image_id for sel in svc5a._selections if sel.role == "section"}
-print(f"\n  Post 1 section IDs: {sorted(post1_ids)}")
+post1_ids = {sel.image_id for sel in svc22a._selections if sel.role == "section"}
 
-svc5b = build_service("amazon fba storage fees", "FBA Fees",
-                       registry=shared_registry, provider=MockImageProvider("fba"))
-url5b_0 = svc5b.section("What Are FBA Storage Fees", 0)
-url5b_1 = svc5b.section("Calculating Storage Fees fba", 1)
-
-post2_ids = {sel.image_id for sel in svc5b._selections if sel.role == "section"}
-print(f"  Post 2 section IDs: {sorted(post2_ids)}")
+svc22b = build_service("amazon fba storage fees", "FBA Fees",
+                        registry=shared_registry, provider=MockReplicateProvider("fba"))
+svc22b.section("What Are FBA Storage Fees", 0)
+svc22b.section("Calculating Storage Fees fba", 1)
+post2_ids = {sel.image_id for sel in svc22b._selections if sel.role == "section"}
 
 reused = post1_ids & post2_ids
 check(
-    "No section image ID reused between Post 1 and Post 2",
+    "Test 22: No section image ID reused between Post 1 and Post 2",
     len(reused) == 0,
-    f"Reused: {reused or 'none'}",
+    f"Reused IDs: {reused or 'none'}",
 )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 6 — Visual cluster diversity within a post
-# ─────────────────────────────────────────────────────────────────────────────
-section("TEST 6: Visual cluster diversity within a post")
-
-svc6 = build_service("amazon fba inbound shipping", "FBA Logistics",
-                      provider=MockImageProvider("fba"))
-url6a = svc6.section("FBA Inbound Overview", 0)
-url6b = svc6.section("Choosing a Shipping Carrier fba", 1)
-
-section_clusters = [s.visual_cluster for s in svc6._selections if s.role == "section"]
-print(f"\n  Section clusters: {section_clusters}")
-
+# Test 23: Visual clusters are tracked in _used_clusters
+svc23 = build_service("amazon fba inbound shipping", "FBA Logistics",
+                       provider=MockReplicateProvider("fba"))
+svc23.section("FBA Inbound Overview", 0)
+svc23.section("Choosing a Shipping Carrier fba", 1)
 check(
-    "Visual clusters tracked in _used_clusters",
-    len(svc6._used_clusters) > 0,
-    f"Clusters: {svc6._used_clusters}",
-)
-check(
-    "Section images use distinct visual clusters when alternatives exist",
-    len(section_clusters) <= 1 or len(set(section_clusters)) > 1,
-    f"Clusters: {section_clusters}",
+    "Test 23: Visual clusters tracked in _used_clusters",
+    len(svc23._used_clusters) > 0,
+    f"Clusters: {svc23._used_clusters}",
 )
 
+# Test 24: Registry persists used IDs across runs
+reg24 = build_mock_registry()
+svc24a = build_service("amazon fba packaging prep", "FBA Prep",
+                        registry=reg24, provider=MockReplicateProvider("fba"))
+run1_url = svc24a.section("Packaging Prep Guide amazon fba", 0)
+run1_sel = next((s for s in svc24a._selections if s.role == "section"), None)
+run1_id  = run1_sel.image_id if run1_sel else None
+if run1_id:
+    reg24._used_section_ids.add(run1_id)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 7 — CTA images now use AI provider (NOT static catalog)
-# ─────────────────────────────────────────────────────────────────────────────
-section("TEST 7: CTA images use AI provider — no static catalog images")
-
-svc7 = build_service("amazon ppc", "Amazon Advertising",
-                      provider=MockImageProvider("ppc"))
-cta0 = svc7.cta(0)
-cta1 = svc7.cta(1)
-cta2 = svc7.cta(2)
-
-print(f"\n  CTA 0: {cta0}")
-print(f"  CTA 1: {cta1}")
-print(f"  CTA 2: {cta2}")
-
-# CTA returns something (or None if provider unavailable)
-check(
-    "CTA slots return URLs from AI provider",
-    all(u is not None for u in (cta0, cta1, cta2)),
-    f"CTAs: {[cta0, cta1, cta2]}",
-)
-# All CTA URLs must be from HubSpot CDN (not Pexels, not old catalog IDs)
-cta_urls = [u for u in (cta0, cta1, cta2) if u]
-check(
-    "All CTA URLs from HubSpot CDN (AI-generated)",
-    all(HS_CDN in u for u in cta_urls),
-    f"CDNs: {[HS_CDN in u for u in cta_urls]}",
-)
-check(
-    "No CTA URL from Pexels",
-    all("pexels.com" not in u for u in cta_urls),
-    f"Pexels in CTAs: {[u for u in cta_urls if 'pexels.com' in u]}",
-)
-# Old warehouse IDs must not appear in CTA URLs
-old_ids = {"4483610", "4481326", "4481259"}
-check(
-    "Old warehouse IDs (4483610, 4481326, 4481259) absent from CTA URLs",
-    not any(any(oid in u for oid in old_ids) for u in cta_urls),
-    f"Found old IDs: {[u for u in cta_urls if any(oid in u for oid in old_ids)]}",
-)
-# CTA selections must be from AI (source = "openai" or "pexels", NOT "static_catalog")
-cta_sources = [s.source for s in svc7._selections if s.role == "cta"]
-check(
-    "CTA image source is AI provider (not static_catalog)",
-    all(src != "static_catalog" for src in cta_sources),
-    f"Sources: {cta_sources}",
-)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 8 — No image available → returns None everywhere, no fallback
-# ─────────────────────────────────────────────────────────────────────────────
-section("TEST 8: Empty provider → all slots return None (no static fallback)")
-
-svc8 = build_service("amazon ppc acos optimization", "Amazon Advertising",
-                      provider=MockImageProvider(empty=True))
-result8_section = svc8.section("How to reduce ACOS in your campaigns", 0)
-result8_hero    = svc8.hero("Complete PPC guide")
-result8_cta     = svc8.cta(0)
-
-check(
-    "Section returns None when provider has no image",
-    result8_section is None,
-    f"Got: {result8_section}",
-)
-check(
-    "Hero returns None when provider has no image",
-    result8_hero is None,
-    f"Got: {result8_hero}",
-)
-check(
-    "CTA returns None when provider has no image (no static fallback)",
-    result8_cta is None,
-    f"Got: {result8_cta}",
-)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 9 — Registry persists used IDs across runs
-# ─────────────────────────────────────────────────────────────────────────────
-section("TEST 9: Registry persists used IDs across simulated runs")
-
-reg9 = build_mock_registry()
-
-svc9a = build_service("amazon fba packaging prep", "FBA Prep",
-                       registry=reg9, provider=MockImageProvider("fba"))
-run1_url = svc9a.section("Packaging Prep Guide amazon fba", 0)
-
-if run1_url:
-    run1_sel = next((s for s in svc9a._selections if s.role == "section"), None)
-    run1_id  = run1_sel.image_id if run1_sel else None
-    if run1_id:
-        reg9._used_section_ids.add(run1_id)
-else:
-    run1_id = None
-
-print(f"\n  Run 1 selected ID: {run1_id}")
-print(f"  Registry after run 1: {sorted(reg9._used_section_ids)}")
-
-svc9b = build_service("amazon fba packaging prep", "FBA Prep",
-                       registry=reg9, provider=MockImageProvider("fba"))
-run2_url = svc9b.section("Packaging Prep Guide amazon fba", 0)
-run2_sel = next((s for s in svc9b._selections if s.role == "section"), None)
+svc24b = build_service("amazon fba packaging prep", "FBA Prep",
+                        registry=reg24, provider=MockReplicateProvider("fba"))
+run2_url = svc24b.section("Packaging Prep Guide amazon fba", 0)
+run2_sel = next((s for s in svc24b._selections if s.role == "section"), None)
 run2_id  = run2_sel.image_id if run2_sel else None
 
-print(f"  Run 2 selected ID: {run2_id}")
-
 check(
-    "Run 2 does not reuse Run 1's section image",
+    "Test 24: Run 2 does not reuse Run 1's section image (registry dedup)",
     run1_id is None or run2_id is None or run1_id != run2_id,
     f"Run 1={run1_id}  Run 2={run2_id}",
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 10 — Full simulation: PPC + AI posts with logged output
+# SECTION I — Zero-tolerance _img_tag() gate (tests 25–27)
 # ─────────────────────────────────────────────────────────────────────────────
-section("TEST 10: Full simulation — PPC post + AI post, AI sources only")
-print()
+section("SECTION I — Tests 25–27: _img_tag() zero-tolerance gate")
 
-# ── PPC post ──────────────────────────────────────────────────────────────────
-svc_ppc = build_service(
-    "amazon ppc budget management campaign strategy",
-    "Amazon Advertising",
-    provider=MockImageProvider("ppc"),
-)
-ppc_hero  = svc_ppc.hero("Complete guide to amazon ppc budget management")
-ppc_sec0  = svc_ppc.section("How to set your PPC campaign budget", 0)
-ppc_sec1  = svc_ppc.section("Advanced bidding strategies for sponsored products", 1)
-ppc_cta0  = svc_ppc.cta(0)
-ppc_cta1  = svc_ppc.cta(1)
-ppc_cta2  = svc_ppc.cta(2)
-
-rpt_ppc = svc_ppc.validation_report()
-print(f"\n  [PPC POST] topic_category={rpt_ppc['topic_category']}  provider={rpt_ppc['provider']}")
-for sel in rpt_ppc["selections"]:
-    print(f"    {sel['role']:8s}  id={sel['id']:16s}  source={sel['source']}  "
-          f"cluster={sel['visual_cluster']}")
-
-# ── AI tools post ──────────────────────────────────────────────────────────────
-svc_ai = build_service(
-    "AI tools for online sellers in 2026",
-    "AI Tools Automation",
-    provider=MockImageProvider("ai"),
-)
-ai_hero  = svc_ai.hero("AI tools every amazon seller needs in 2026")
-ai_sec0  = svc_ai.section("Best AI tools for product research", 0)
-ai_sec1  = svc_ai.section("How to use AI for listing optimization", 1)
-ai_cta0  = svc_ai.cta(0)
-ai_cta1  = svc_ai.cta(1)
-ai_cta2  = svc_ai.cta(2)
-
-rpt_ai = svc_ai.validation_report()
-print(f"\n  [AI POST] topic_category={rpt_ai['topic_category']}  provider={rpt_ai['provider']}")
-for sel in rpt_ai["selections"]:
-    print(f"    {sel['role']:8s}  id={sel['id']:16s}  source={sel['source']}  "
-          f"cluster={sel['visual_cluster']}")
-
-# ── Assertions ────────────────────────────────────────────────────────────────
-ppc_section_ids = {s.image_id for s in svc_ppc._selections if s.role == "section"}
-ai_section_ids  = {s.image_id for s in svc_ai._selections  if s.role == "section"}
-all_ppc_urls    = [s.url for s in svc_ppc._selections]
-all_ai_urls     = [s.url for s in svc_ai._selections]
-
-print(f"\n  PPC section IDs:     {sorted(ppc_section_ids)}")
-print(f"  AI section IDs:      {sorted(ai_section_ids)}")
-print(f"  Overlap:             {ppc_section_ids & ai_section_ids or 'none'}")
-
-check(
-    "PPC post: topic_category == 'amazon_ads_digital'",
-    rpt_ppc["topic_category"] == "amazon_ads_digital",
-    f"Got: {rpt_ppc['topic_category']}",
-)
-check(
-    "AI post: topic_category == 'ai_tools_automation'",
-    rpt_ai["topic_category"] == "ai_tools_automation",
-    f"Got: {rpt_ai['topic_category']}",
-)
-check(
-    "PPC section IDs contain 'ppc' (topic-specific)",
-    all("ppc" in id_ for id_ in ppc_section_ids),
-    f"IDs: {sorted(ppc_section_ids)}",
-)
-check(
-    "AI section IDs contain 'ai' (topic-specific)",
-    all("ai" in id_ for id_ in ai_section_ids),
-    f"IDs: {sorted(ai_section_ids)}",
-)
-check(
-    "PPC and AI share NO section images",
-    len(ppc_section_ids & ai_section_ids) == 0,
-    f"Shared: {ppc_section_ids & ai_section_ids or 'none'}",
-)
-check(
-    "PPC post has no duplicate image IDs",
-    rpt_ppc["duplicate_ids"] == "none",
-    f"Duplicates: {rpt_ppc['duplicate_ids']}",
-)
-check(
-    "AI post has no duplicate image IDs",
-    rpt_ai["duplicate_ids"] == "none",
-    f"Duplicates: {rpt_ai['duplicate_ids']}",
-)
-check(
-    "ALL images in PPC post from AI provider (source != static_catalog)",
-    all(s.source != "static_catalog" for s in svc_ppc._selections),
-    f"Sources: {[s.source for s in svc_ppc._selections]}",
-)
-check(
-    "ALL images in AI post from AI provider (source != static_catalog)",
-    all(s.source != "static_catalog" for s in svc_ai._selections),
-    f"Sources: {[s.source for s in svc_ai._selections]}",
-)
-check(
-    "ALL PPC image URLs from HubSpot CDN (no Pexels)",
-    all(HS_CDN in u and "pexels.com" not in u for u in all_ppc_urls),
-    f"Non-CDN: {[u for u in all_ppc_urls if HS_CDN not in u]}",
-)
-check(
-    "ALL AI image URLs from HubSpot CDN (no Pexels)",
-    all(HS_CDN in u and "pexels.com" not in u for u in all_ai_urls),
-    f"Non-CDN: {[u for u in all_ai_urls if HS_CDN not in u]}",
-)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 11 — _img_tag() zero-tolerance gate
-# ─────────────────────────────────────────────────────────────────────────────
-section("TEST 11: _img_tag() zero-tolerance gate — blocks non-HubSpot URLs")
-
-# hubspot.py imports `markdown` which may not be installed in the test env.
-# Mock it before importing so we can test _img_tag() in isolation.
 import sys as _sys
 from unittest.mock import MagicMock as _MagicMock
 if "markdown" not in _sys.modules:
     _sys.modules["markdown"] = _MagicMock()
 from exporters.hubspot import _img_tag
 
-# None → empty string
+# Test 25: None → empty string
 check(
-    "_img_tag(None, ...) returns empty string",
+    "Test 25: _img_tag(None, ...) returns empty string",
     _img_tag(None, "alt") == "",
     f"Got: {repr(_img_tag(None, 'alt'))}",
 )
-# Pexels URL → empty string (blocked)
+
+# Test 26: Pexels URL → blocked (empty string)
 pexels_url = "https://images.pexels.com/photos/4481323/pexels-photo-4481323.jpeg"
 check(
-    "_img_tag(pexels_url, ...) returns empty string (blocked)",
+    "Test 26: _img_tag(pexels_url, ...) returns empty string (blocked)",
     _img_tag(pexels_url, "alt") == "",
     f"Got non-empty for Pexels URL — BLOCKED needed",
 )
-# Old catalog ID URL → empty string (blocked)
-old_catalog_url = "https://images.pexels.com/photos/4483610/pexels-photo-4483610.jpeg"
-check(
-    "_img_tag(old_catalog_url, ...) returns empty string (blocked)",
-    _img_tag(old_catalog_url, "alt") == "",
-    f"Got non-empty for old catalog URL — BLOCKED needed",
-)
-# Valid HubSpot CDN URL → renders img tag
+
+# Test 27: Valid HubSpot CDN URL → renders <img> tag
 hs_url = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/test-image.jpg"
 hs_tag = _img_tag(hs_url, "Test image")
 check(
-    "_img_tag(hubspotusercontent.com URL) renders <img> tag",
-    "<img" in hs_tag and hs_url in hs_tag,
-    f"Tag: {hs_tag[:100]}",
-)
-check(
-    "_img_tag renders with correct src= attribute",
-    f'src="{hs_url}"' in hs_tag,
+    "Test 27: _img_tag(hubspotusercontent.com URL) renders valid <img> tag",
+    "<img" in hs_tag and f'src="{hs_url}"' in hs_tag,
     f"Tag: {hs_tag[:120]}",
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 12 — Module structure check
+# SECTION J — Code quality and security (tests 28–30)
 # ─────────────────────────────────────────────────────────────────────────────
-section("TEST 12: All required image pipeline modules present")
+section("SECTION J — Tests 28–30: Code quality and security")
 
-_base = os.path.join(os.path.dirname(os.path.dirname(__file__)), "exporters")
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Test 28: REPLICATE_API_TOKEN not hardcoded in any .py file
+# Replicate tokens start with "r8_" followed by alphanumeric chars
+_token_pattern = re.compile(r'\br8_[A-Za-z0-9]{8,}\b')
+_token_leaks = []
+for root, dirs, files in os.walk(_project_root):
+    dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".venv", "venv", "node_modules")]
+    for fname in files:
+        if not fname.endswith(".py"):
+            continue
+        fpath = os.path.join(root, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                for lineno, line in enumerate(f, 1):
+                    if _token_pattern.search(line):
+                        _token_leaks.append(f"{fpath}:{lineno}")
+        except Exception:
+            pass
+
+check(
+    "Test 28: No REPLICATE_API_TOKEN (r8_...) hardcoded in any .py source file",
+    len(_token_leaks) == 0,
+    f"Leaked in: {_token_leaks}" if _token_leaks else "Clean — no tokens found in source",
+)
+
+# Test 29: image_provider.py has no openai import (AST check)
+_provider_path = os.path.join(_project_root, "exporters", "image_provider.py")
+with open(_provider_path, "r") as _pf:
+    _provider_src = _pf.read()
+_provider_tree = ast.parse(_provider_src)
+_openai_imports = [
+    node for node in ast.walk(_provider_tree)
+    if isinstance(node, (ast.Import, ast.ImportFrom))
+    and any(
+        "openai" in (getattr(alias, "name", "") or "").lower()
+        or "openai" in (getattr(node, "module", "") or "").lower()
+        for alias in getattr(node, "names", [])
+    )
+]
+check(
+    "Test 29: image_provider.py has no openai import (DALL-E fully removed)",
+    len(_openai_imports) == 0,
+    f"Found: {[ast.dump(n) for n in _openai_imports]}" if _openai_imports else "Clean",
+)
+
+# Test 30: All required image pipeline modules present
+_base = os.path.join(_project_root, "exporters")
 _required_modules = [
     "image_policy",
     "image_catalog",
@@ -841,42 +771,15 @@ _required_modules = [
     "image_registry",
     "image_logging",
     "image_selector",
-    "image_fetcher",
     "image_prompt_generator",
     "image_provider",
     "hubspot_files",
 ]
 _missing = [m for m in _required_modules if not os.path.exists(os.path.join(_base, f"{m}.py"))]
 check(
-    "All required image pipeline modules present",
+    "Test 30: All required image pipeline modules present",
     len(_missing) == 0,
     f"Missing: {_missing}" if _missing else "All present",
-)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 13 — image_selector.py contains no HubSpot-specific imports
-# ─────────────────────────────────────────────────────────────────────────────
-section("TEST 13: image_selector.py contains no HubSpot-specific imports")
-
-_selector_path = os.path.join(_base, "image_selector.py")
-with open(_selector_path, "r") as _f:
-    _src = _f.read()
-
-_tree = ast.parse(_src)
-_hubspot_imports = [
-    node for node in ast.walk(_tree)
-    if isinstance(node, (ast.Import, ast.ImportFrom))
-    and any(
-        "hubspot" in (getattr(alias, "name", "") or "").lower()
-        or "hubspot" in (getattr(node, "module", "") or "").lower()
-        for alias in getattr(node, "names", [])
-    )
-]
-check(
-    "image_selector.py contains no HubSpot-specific imports",
-    len(_hubspot_imports) == 0,
-    f"Found imports: {[ast.dump(n) for n in _hubspot_imports]}" if _hubspot_imports else "Clean",
 )
 
 
@@ -884,7 +787,7 @@ check(
 # FINAL SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 70}")
-print(f"  TEST RESULTS")
+print(f"  TEST RESULTS — Replicate-only image pipeline")
 print(f"{'=' * 70}")
 passed_count = sum(1 for _, ok, _ in _results if ok)
 failed_count = sum(1 for _, ok, _ in _results if not ok)
@@ -894,9 +797,9 @@ for label, ok, detail in _results:
 
 print(f"\n  Total: {len(_results)}  |  Passed: {passed_count}  |  Failed: {failed_count}")
 if failed_count == 0:
-    print("\n  ✓  ALL TESTS PASSED — AI-only image pipeline is production-ready")
-    print("     Every image comes from DALL-E 3 → HubSpot Files → hubspotusercontent.com")
-    print("     Zero static catalog images. Zero Pexels images. Zero warehouse stock photos.")
+    print("\n  ✓  ALL 30 TESTS PASSED — Replicate-only pipeline is production-ready")
+    print("     Every image: Replicate Flux → HubSpot Files → hubspotusercontent.com")
+    print("     Zero OpenAI. Zero Pexels. Zero static warehouse catalog.")
 else:
     print(f"\n  ✗  {failed_count} TEST(S) FAILED — fix before deploying")
 

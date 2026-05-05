@@ -110,6 +110,11 @@ def upload_to_hubspot(
     if not safe_filename.endswith(".jpg"):
         safe_filename += ".jpg"
 
+    log.info(
+        f"[HUBSPOT_FILE_UPLOAD_STARTED] filename={safe_filename}  "
+        f"folder={folder_path}  size={len(image_bytes):,}_bytes"
+    )
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.post(
@@ -172,7 +177,10 @@ def upload_to_hubspot(
             if attempt < MAX_RETRIES:
                 time.sleep(1)
 
-    log.warning(f"[HUBSPOT_FILES] All upload attempts failed for '{safe_filename}'")
+    log.warning(
+        f"[HUBSPOT_FILE_UPLOAD_FAILED] filename={safe_filename}  "
+        f"folder={folder_path}  attempts={MAX_RETRIES}"
+    )
     return None
 
 

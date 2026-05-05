@@ -80,10 +80,11 @@ class ImageSelection:
     visual_cluster:  str
     relevance_score: float
     context:         str         # section heading or "" for hero/cta
-    source:          str         # "openai" | "pexels" | "static_catalog"
-    search_query:    str         # Pexels query or "" for AI/static
+    source:          str         # "replicate" | "none" | "static_catalog"
+    search_query:    str         # search query or "" for AI
     prompt_hash:     str         # sha256 prefix of prompt text
-    provider_id:     str         # provider's own ID (HS file ID, Pexels photo ID)
+    provider_id:     str         # provider's own ID (HS file ID)
+    model:           str = ""    # model used (e.g. "black-forest-labs/flux-schnell")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,6 +158,10 @@ class ImageSelectionService:
 
         # Image provider — injectable for tests
         self._provider = _provider if _provider is not None else get_provider()
+
+        # Notify provider that a new post is starting (resets per-post cost tracking)
+        if hasattr(self._provider, "start_post"):
+            self._provider.start_post()
 
         # Per-post state
         self._used_urls:     set  = set()
@@ -240,11 +245,13 @@ class ImageSelectionService:
             search_query    = asset.search_query,
             prompt_hash     = asset.prompt_hash,
             provider_id     = asset.provider_id,
+            model           = getattr(asset, "model", ""),
         )
         self._record(sel)
         log.info(
             f"[IMAGE_INSERTED] role=hero  "
             f"source={asset.provider}  "
+            f"model={getattr(asset, 'model', '')}  "
             f"provider_id={asset.provider_id}  "
             f"url={asset.url[:80]}"
         )
@@ -295,12 +302,14 @@ class ImageSelectionService:
             search_query    = asset.search_query,
             prompt_hash     = asset.prompt_hash,
             provider_id     = asset.provider_id,
+            model           = getattr(asset, "model", ""),
         )
         self._record(sel)
         self._section_count += 1
         log.info(
             f"[IMAGE_INSERTED] role=section  "
             f"source={asset.provider}  "
+            f"model={getattr(asset, 'model', '')}  "
             f"provider_id={asset.provider_id}  "
             f"url={asset.url[:80]}"
         )
@@ -340,11 +349,13 @@ class ImageSelectionService:
             search_query    = asset.search_query,
             prompt_hash     = asset.prompt_hash,
             provider_id     = asset.provider_id,
+            model           = getattr(asset, "model", ""),
         )
         self._record(sel)
         log.info(
             f"[IMAGE_INSERTED] role=cta  slot={slot}  "
             f"source={asset.provider}  "
+            f"model={getattr(asset, 'model', '')}  "
             f"provider_id={asset.provider_id}  "
             f"url={asset.url[:80]}"
         )
@@ -391,6 +402,8 @@ class ImageSelectionService:
                 relevance_score      = sel.relevance_score,
                 prompt_used          = sel.prompt_hash,
                 provider_image_id    = sel.provider_id,
+                provider             = sel.source,
+                model                = getattr(sel, "model", ""),
                 selected_at          = ts,
             ))
 

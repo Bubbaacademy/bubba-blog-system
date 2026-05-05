@@ -1,6 +1,6 @@
 # ── AI ─────────────────────────────────────────────────────────────────────────
 anthropic>=0.97.0
-openai>=1.0.0          # DALL-E 3 image generation (required for AI image pipeline)
+replicate>=0.25.0      # Replicate Flux image generation (required for AI image pipeline)
 
 # ── Web server (Render health endpoint) ────────────────────────────────────────
 flask>=3.0.0
