@@ -155,6 +155,40 @@ class ImageRegistry:
         self._ws                      = None
         self._load()
 
+    # ── Internal: header repair ───────────────────────────────────────────────
+
+    def _ensure_header(self, ws) -> None:
+        """
+        Guarantee row 1 of the worksheet matches HEADER_ROW exactly.
+
+        Repairs three failure modes without touching any data rows:
+          1. Header has duplicate column names (gspread raises on get_all_records)
+          2. Header has fewer columns than HEADER_ROW (schema was extended)
+          3. Header is completely missing or empty
+
+        Safe: only overwrites row 1. Rows 2+ (data) are never modified.
+        """
+        try:
+            current = ws.row_values(1)
+        except Exception as exc:
+            log.warning(f"[IMAGE_REGISTRY_LOADED] Could not read header row: {exc}")
+            current = []
+
+        has_duplicates = len(current) != len(set(current))
+        needs_repair   = (current != HEADER_ROW) or has_duplicates
+
+        if needs_repair:
+            reason = "duplicates" if has_duplicates else "schema mismatch or missing columns"
+            log.warning(
+                f"[IMAGE_REGISTRY_LOADED] Header repair triggered ({reason})  "
+                f"old={current}  new={HEADER_ROW}"
+            )
+            try:
+                ws.update("A1", [HEADER_ROW])
+                log.info("[IMAGE_REGISTRY_LOADED] Header row repaired successfully")
+            except Exception as exc:
+                log.warning(f"[IMAGE_REGISTRY_LOADED] Header repair write failed: {exc}")
+
     # ── Internal: load from Sheets ────────────────────────────────────────────
 
     def _load(self):
@@ -165,7 +199,16 @@ class ImageRegistry:
 
             if TAB_NAME in titles:
                 self._ws  = spreadsheet.worksheet(TAB_NAME)
-                all_rows  = self._ws.get_all_records()
+
+                # Always verify/repair header before loading records.
+                # Prevents gspread "duplicate headers" error on get_all_records().
+                self._ensure_header(self._ws)
+
+                try:
+                    all_rows = self._ws.get_all_records(expected_headers=HEADER_ROW)
+                except TypeError:
+                    # gspread <6.x doesn't have expected_headers — fall back
+                    all_rows = self._ws.get_all_records()
 
                 for row in all_rows:
                     img_id   = str(row.get("image_id", "")).strip()

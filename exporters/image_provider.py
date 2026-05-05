@@ -122,11 +122,31 @@ class OpenAIImageProvider(ImageProvider):
     _LAST_CALL    = 0.0
 
     def __init__(self):
-        self._api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if self._api_key:
+        self._api_key      = os.environ.get("OPENAI_API_KEY", "").strip()
+        self._pkg_available = self._check_package()
+
+        if not self._pkg_available:
+            log.error(
+                "[AI_IMAGE_FAILED] openai Python package is not installed. "
+                "Add 'openai>=1.0.0' to requirements.txt and redeploy. "
+                "No AI images will be generated until this is fixed."
+            )
+        elif self._api_key:
             log.info("[IMAGE_PROVIDER] OpenAIImageProvider ready (DALL-E 3)")
         else:
-            log.info("[IMAGE_PROVIDER] OpenAIImageProvider: OPENAI_API_KEY not set")
+            log.warning(
+                "[IMAGE_PROVIDER] OPENAI_API_KEY not set — "
+                "OpenAI provider disabled. Set OPENAI_API_KEY in Render env vars."
+            )
+
+    @staticmethod
+    def _check_package() -> bool:
+        """Return True if the openai package is importable."""
+        try:
+            import openai  # noqa: F401
+            return True
+        except ImportError:
+            return False
 
     @property
     def name(self) -> str:
@@ -134,13 +154,26 @@ class OpenAIImageProvider(ImageProvider):
 
     @property
     def available(self) -> bool:
-        return bool(self._api_key)
+        return bool(self._api_key) and self._pkg_available
 
     def get_image(self, prompt, article_slug, slot_name, registry, used_urls) -> "ImageAsset | None":
-        if not self._api_key:
+        if not self._pkg_available:
+            log.error(
+                f"[AI_IMAGE_FAILED] slot={slot_name}  "
+                f"reason=OPENAI_PACKAGE_NOT_INSTALLED  "
+                f"fix='add openai>=1.0.0 to requirements.txt and redeploy'"
+            )
             return None
 
-        # Rate limit: 0.5s between calls to avoid burst limit
+        if not self._api_key:
+            log.error(
+                f"[AI_IMAGE_FAILED] slot={slot_name}  "
+                f"reason=OPENAI_API_KEY_NOT_SET  "
+                f"fix='set OPENAI_API_KEY in Render environment variables'"
+            )
+            return None
+
+        # Rate limit: 0.5s between calls
         elapsed = time.time() - OpenAIImageProvider._LAST_CALL
         if elapsed < 0.5:
             time.sleep(0.5 - elapsed)
@@ -158,7 +191,7 @@ class OpenAIImageProvider(ImageProvider):
 
             response = client.images.generate(
                 model   = self._DALL_E_MODEL,
-                prompt  = prompt.text[:4000],  # DALL-E 3 max prompt length
+                prompt  = prompt.text[:4000],
                 n       = 1,
                 size    = self._SIZE,
                 quality = self._QUALITY,
@@ -173,16 +206,17 @@ class OpenAIImageProvider(ImageProvider):
 
             log.info(
                 f"[AI_IMAGE_GENERATED] provider=dall-e-3  "
+                f"slot={slot_name}  "
                 f"provider_id={provider_id}  "
                 f"prompt_hash={prompt.prompt_hash}  "
                 f"temp_url={temp_url[:80]}"
             )
 
-            # Check dedup before uploading (avoid wasting HubSpot storage)
+            # Global dedup check before uploading
             if registry.is_globally_used(provider_id):
                 log.info(
                     f"[IMAGE_PROVIDER] provider_id={provider_id} "
-                    f"already in registry — skipping"
+                    f"already in registry — skipping upload"
                 )
                 return None
 
@@ -195,24 +229,28 @@ class OpenAIImageProvider(ImageProvider):
             )
 
             if not permanent_url:
-                log.warning(
-                    f"[IMAGE_PROVIDER] HubSpot upload failed for DALL-E image  "
-                    f"slot={slot_name} — skipping this slot"
+                log.error(
+                    f"[AI_IMAGE_FAILED] slot={slot_name}  "
+                    f"reason=HUBSPOT_FILES_UPLOAD_FAILED  "
+                    f"provider_id={provider_id}  "
+                    f"check=HUBSPOT_TOKEN env var and /bubba-blog-images folder access"
                 )
                 return None
 
-            # Local dedup check
+            # Within-post dedup check
             if permanent_url in used_urls:
-                log.info(f"[IMAGE_PROVIDER] url already used in this post — skipping")
+                log.info(
+                    f"[IMAGE_PROVIDER] url already used in this post — skipping  "
+                    f"url={permanent_url[:60]}"
+                )
                 return None
 
             log.info(
-                f"[HUBSPOT_FILE_UPLOADED] provider_id={provider_id}  "
-                f"slot={slot_name}  "
-                f"url={permanent_url[:80]}"
+                f"[HUBSPOT_FILE_UPLOADED] slot={slot_name}  "
+                f"provider_id={provider_id}  "
+                f"permanent_url={permanent_url[:80]}"
             )
 
-            # Derive visual cluster from slot for diversity tracking
             visual_cluster = f"ai_{prompt.topic_category}_{slot_name.split('_')[0]}"
 
             return ImageAsset(
@@ -226,13 +264,41 @@ class OpenAIImageProvider(ImageProvider):
             )
 
         except ImportError:
-            log.warning(
-                "[IMAGE_PROVIDER] openai package not installed — "
-                "run: pip install openai"
+            # Should not reach here since _check_package() ran at init,
+            # but guard defensively.
+            log.error(
+                f"[AI_IMAGE_FAILED] slot={slot_name}  "
+                f"reason=OPENAI_IMPORT_ERROR  "
+                f"fix='add openai>=1.0.0 to requirements.txt and redeploy'"
             )
             return None
+
         except Exception as exc:
-            log.warning(f"[IMAGE_PROVIDER] DALL-E 3 error: {exc}")
+            # Classify common OpenAI SDK errors for actionable log messages
+            exc_type = type(exc).__name__
+            exc_str  = str(exc)
+
+            if "AuthenticationError" in exc_type or "authentication" in exc_str.lower():
+                reason = "OPENAI_API_KEY_INVALID"
+                fix    = "verify OPENAI_API_KEY in Render env vars"
+            elif "RateLimitError" in exc_type or "rate_limit" in exc_str.lower():
+                reason = "OPENAI_RATE_LIMIT"
+                fix    = "reduce generation frequency or upgrade OpenAI tier"
+            elif "ContentPolicyViolation" in exc_type or "content_policy" in exc_str.lower():
+                reason = "DALL_E_CONTENT_POLICY_VIOLATION"
+                fix    = "review prompt for policy-violating terms"
+            elif "InvalidRequestError" in exc_type or "invalid_request" in exc_str.lower():
+                reason = "OPENAI_INVALID_REQUEST"
+                fix    = f"check prompt length and API params — {exc_str[:100]}"
+            else:
+                reason = f"OPENAI_API_ERROR:{exc_type}"
+                fix    = str(exc_str)[:120]
+
+            log.error(
+                f"[AI_IMAGE_FAILED] slot={slot_name}  "
+                f"reason={reason}  "
+                f"fix='{fix}'"
+            )
             return None
 
 
