@@ -140,19 +140,25 @@ def validate_post_package(hs_data):
         )
 
     # ── Images ────────────────────────────────────────────────────────────────
-    img_urls   = re.findall(r'src="(https://[^"]+pexels[^"]+)"', body)
+    # Match both Pexels CDN and HubSpot Files CDN (for AI-generated images)
+    _TRUSTED_CDN = ("images.pexels.com", "hubspotusercontent.com")
+    img_urls   = re.findall(
+        r'src="(https://(?:[^"]+pexels[^"]+|[^"]+hubspotusercontent[^"]+))"',
+        body,
+    )
     img_ids    = [m.group(1) for m in (re.search(r'/photos/(\d+)/', u) for u in img_urls) if m]
     id_counts  = Counter(img_ids)
     duplicates = [id_ for id_, n in id_counts.items() if n > 1]
-    # With dynamic Pexels API fetching, IDs are not in a static approved set.
-    # Instead, verify all image URLs come from the trusted Pexels CDN.
-    # This catches any accidental non-Pexels images while allowing dynamic IDs.
-    untrusted  = [u for u in img_urls if "images.pexels.com" not in u]
+    # Allow both Pexels CDN (stock photos) and HubSpot Files CDN (AI-generated).
+    untrusted  = [u for u in img_urls if not any(cdn in u for cdn in _TRUSTED_CDN)]
 
     if duplicates:
         errors.append(f"Duplicate image IDs: {duplicates}")
     if untrusted:
-        errors.append(f"Images from untrusted sources (must be images.pexels.com): {untrusted}")
+        errors.append(
+            f"Images from untrusted sources "
+            f"(must be images.pexels.com or hubspotusercontent.com): {untrusted}"
+        )
     if len(img_urls) < MIN_IMAGES:
         errors.append(f"Only {len(img_urls)} image(s) — minimum is {MIN_IMAGES}")
     if len(img_urls) > MAX_IMAGES:

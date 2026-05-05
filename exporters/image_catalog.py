@@ -144,7 +144,7 @@ IMAGE_CATALOG: list = [
         relevance_keywords=("warehouse", "inventory", "storage", "fulfillment", "fba", "amazon",
                              "logistics", "distribution"),
         reusable_cta=False,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # section/hero: AI-generated images only
         roles=(ROLE_SECTION, ROLE_HERO),
     ),
 
@@ -162,7 +162,7 @@ IMAGE_CATALOG: list = [
         relevance_keywords=("warehouse", "inventory", "management", "fulfillment", "fba",
                              "team", "workers", "amazon"),
         reusable_cta=False,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # section/hero: AI-generated images only
         roles=(ROLE_SECTION,),
     ),
 
@@ -181,7 +181,7 @@ IMAGE_CATALOG: list = [
         relevance_keywords=("shipping", "inbound", "delivery", "courier", "fba",
                              "logistics", "boxes", "shipment"),
         reusable_cta=False,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # section/hero: AI-generated images only
         roles=(ROLE_SECTION,),
     ),
 
@@ -200,7 +200,7 @@ IMAGE_CATALOG: list = [
         relevance_keywords=("shipping", "inbound", "loading", "boxes", "delivery",
                              "fba", "logistics"),
         reusable_cta=False,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # section/hero: AI-generated images only
         roles=(ROLE_SECTION,),
     ),
 
@@ -219,7 +219,7 @@ IMAGE_CATALOG: list = [
         relevance_keywords=("freight", "shipping", "containers", "port", "import",
                              "logistics", "international", "supply"),
         reusable_cta=False,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # section/hero: AI-generated images only
         roles=(ROLE_SECTION,),
     ),
 
@@ -238,7 +238,7 @@ IMAGE_CATALOG: list = [
         relevance_keywords=("freight", "shipping", "containers", "cargo", "import",
                              "logistics", "international", "aerial"),
         reusable_cta=False,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # section/hero: AI-generated images only
         roles=(ROLE_SECTION,),
     ),
 
@@ -257,7 +257,7 @@ IMAGE_CATALOG: list = [
         relevance_keywords=("packaging", "prep", "sealing", "boxes", "inbound",
                              "fba", "shipment", "packing"),
         reusable_cta=False,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # section/hero: AI-generated images only
         roles=(ROLE_SECTION,),
     ),
 
@@ -276,7 +276,7 @@ IMAGE_CATALOG: list = [
         relevance_keywords=("packaging", "packing", "taping", "boxes", "fulfillment",
                              "fba", "inbound", "prep"),
         reusable_cta=False,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # section/hero: AI-generated images only
         roles=(ROLE_SECTION,),
     ),
 
@@ -295,7 +295,7 @@ IMAGE_CATALOG: list = [
         relevance_keywords=("inventory", "boxes", "labeled", "shipping", "delivery",
                              "fba", "inbound", "preparation"),
         reusable_cta=False,
-        status=STATUS_APPROVED,
+        status=STATUS_DISABLED,   # section/hero: AI-generated images only
         roles=(ROLE_SECTION,),
     ),
 

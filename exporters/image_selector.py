@@ -1,77 +1,73 @@
 """
 image_selector.py — ImageSelectionService: per-post image selection engine.
 
-ARCHITECTURE
-------------
-Two image sources, one selector:
+ARCHITECTURE (v3 — AI-first)
+------------------------------
+TWO image sources, strict separation:
 
-  A. Section / Hero images — fetched DYNAMICALLY from Pexels API
-     ─────────────────────────────────────────────────────────────
+  A. Section / Hero images — AI GENERATED or PEXELS FALLBACK (never static)
+     ─────────────────────────────────────────────────────────────────────────
      1. Route keyword+cluster → topic_category
-     2. Generate topic-specific search queries (image_router.get_search_queries)
-     3. Fetch candidates from Pexels API (image_fetcher.fetch_and_score)
-     4. Apply gates: global dedup, blocked tags, topic negative terms, min score
-     5. Pick highest-scoring candidate. None if nothing passes.
-     6. No fallback — article publishes without section images when None.
+     2. Generate topic+heading-specific prompt (image_prompt_generator)
+     3. Get image from provider chain (image_provider):
+        a. DALL-E 3 (if OPENAI_API_KEY) → upload to HubSpot Files → permanent URL
+        b. Pexels API (if PEXELS_API_KEY) → Pexels CDN URL
+        c. None → section image skipped; article still publishes
+     4. Apply global dedup (registry) and within-post dedup
+     5. Return URL or None
 
-  B. CTA images — from STATIC CATALOG (image_catalog.py)
-     ─────────────────────────────────────────────────────
-     1. Load approved CTA entries (reusable_cta=True)
-     2. Apply gates 1–6 from the static pipeline
-     3. Rotate through CTA pool to avoid within-post duplicates
-     4. CTA images are reusable across posts (never in global dedup set)
+  B. CTA images — STATIC CATALOG only (image_catalog.py)
+     ──────────────────────────────────────────────────────
+     The 3 warehouse CTA images are brand-consistent decorative blocks.
+     They are never used for section/hero roles.
+     CTA images with reusable_cta=True freely repeat across posts.
+
+HARD RULES
+----------
+• Static catalog images NEVER appear in section or hero slots.
+• If no image provider is configured: section/hero = None (no fallback).
+• If provider fails: section/hero = None (no fallback to warehouse).
+• CTA pool exhaustion: cycles through available CTAs (never None for CTA).
 
 PUBLIC API
 ----------
-    service = ImageSelectionService(keyword, topic_cluster, title, slug)
-    hero_url    = service.hero(article_intro_text)      # str | None
-    section_url = service.section(heading_text, index)  # str | None
-    cta_url     = service.cta(slot)                     # str (never None)
+    service = ImageSelectionService(keyword, cluster, title, slug)
+    hero_url    = service.hero(article_intro_text)
+    section_url = service.section(heading_text, index, paragraph_snippet)
+    cta_url     = service.cta(slot)
     # After validation + API success:
-    service.commit(post_slug, post_title, keyword, topic_cluster)
+    service.commit(post_slug, post_title, keyword, cluster)
     report = service.validation_report()
-
-COMMIT FLOW
------------
-commit() is called ONCE from hubspot_api.py AFTER:
-  • validate_post_package() passes
-  • HubSpot API POST succeeds (or DRY_RUN)
-During selection, no Sheets writes occur.
 """
 from __future__ import annotations
 
 import re
 import datetime
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections import Counter
 from typing import Optional
 
 from exporters.image_policy import (
     BLOCKED_TAGS, BLOCKED_DESCRIPTION_WORDS, NOISE_TAGS, STOPWORDS,
-    QUALITY_THRESHOLD, RELEVANCE_THRESHOLD, TAG_RECALL_FLOOR, DESC_RECALL_FLOOR,
-    NOISE_PENALTY, MAX_NOISE_PENALTY,
-    VISUAL_CLUSTER_PENALTY,
-    CROSS_POST_CLUSTER_PENALTY_PER_USE, MAX_CROSS_POST_CLUSTER_PENALTY,
-    STATUS_APPROVED, ROLE_HERO, ROLE_SECTION, ROLE_CTA,
+    QUALITY_THRESHOLD, STATUS_APPROVED, ROLE_HERO, ROLE_SECTION, ROLE_CTA,
     MAX_SECTION_IMAGES,
 )
 from exporters.image_catalog import (
     ImageEntry, IMAGE_CATALOG, get_approved,
     APPROVED_IDS, APPROVED_PEXELS_IDS,
 )
-from exporters.image_router import route, get_search_queries
+from exporters.image_router import route
 from exporters.image_registry import get_registry, RegistryEntry, ImageRegistry
-from exporters.image_fetcher import (
-    FetchedImage, fetch_and_score, get_pexels_client,
-)
+from exporters.image_prompt_generator import generate_prompt, ImagePrompt
+from exporters.image_provider import get_provider, ImageAsset
 import exporters.image_logging as ilog
 
 log = logging.getLogger("image_selector")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ImageSelection — result object for one selected image
+# ImageSelection — result record
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -84,47 +80,27 @@ class ImageSelection:
     visual_cluster:  str
     relevance_score: float
     context:         str         # section heading or "" for hero/cta
-    source:          str         # "pexels_api" | "static_catalog"
-    search_query:    str         # Pexels query that found this image (or "" for static)
+    source:          str         # "openai" | "pexels" | "static_catalog"
+    search_query:    str         # Pexels query or "" for AI/static
+    prompt_hash:     str         # sha256 prefix of prompt text
+    provider_id:     str         # provider's own ID (HS file ID, Pexels photo ID)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Static catalog gate evaluator (used for CTA images only)
+# Static catalog CTA gate evaluator
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _clean_words(text: str) -> set:
-    return set(re.sub(r"[^a-z0-9\s]", " ", text.lower()).split())
-
-
-def _meaningful_words(text: str) -> set:
-    return _clean_words(text) - STOPWORDS
-
-
-def _evaluate_cta_gates(
-    entry: ImageEntry,
-    used_clusters_this_post: set,
-    registry: ImageRegistry,
-) -> tuple:
+def _evaluate_cta_gates(entry: ImageEntry) -> tuple:
     """
-    Run a static catalog CTA entry through its gates.
-
-    Gates for CTA (decorative, topic-independent):
-      1  status == approved
-      2  quality_score >= QUALITY_THRESHOLD
-      3  no BLOCKED_TAGS in tags
-      4  no BLOCKED_DESCRIPTION_WORDS in description
-      5  reusable_cta=True (CTA images only — enforced upstream in .cta())
-
-    Returns (passed: bool, reason: str, score: float)
-    CTA score is always 1.0 if it passes — they're decorative, not relevance-scored.
+    Gate check for static catalog CTA images.
+    Returns (passed: bool, reason: str, score: float).
+    Score is always 1.0 for CTAs (decorative, not relevance-scored).
     """
-    pid = entry.image_id
-
-    if not entry.is_approved():
+    if entry.status != STATUS_APPROVED:
         return False, f"REJECTED_DISABLED:status={entry.status}", 0.0
 
     if entry.quality_score < QUALITY_THRESHOLD:
-        return False, f"REJECTED_LOW_QUALITY:{entry.quality_score:.2f}<{QUALITY_THRESHOLD}", 0.0
+        return False, f"REJECTED_LOW_QUALITY:{entry.quality_score:.2f}", 0.0
 
     tags_lower = {t.lower() for t in entry.tags}
     hit = tags_lower & BLOCKED_TAGS
@@ -145,44 +121,42 @@ def _evaluate_cta_gates(
 
 class ImageSelectionService:
     """
-    Per-post image selection service.
+    Per-post image selection orchestrator.
 
-    One instance per article. Two image sources:
-    - Dynamic Pexels API for section + hero (topic-relevant, globally deduped)
-    - Static catalog for CTA (brand-consistent, reusable across posts)
+    Section/Hero: AI generation (DALL-E 3) or Pexels fallback — NEVER static warehouse.
+    CTA: Static catalog only (3 reusable brand images).
 
-    Usage
-    -----
+    Usage:
         service = ImageSelectionService(keyword, cluster, title, slug)
         service.hero(intro_text)
-        service.section(heading, 0)
+        service.section(heading, 0, paragraph_snippet)
         service.cta(0); service.cta(1); service.cta(2)
-        # Later, after validation passes:
+        # After publish succeeds:
         service.commit(slug, title, keyword, cluster)
     """
 
     def __init__(
         self,
-        article_keyword: str = "",
+        article_keyword:       str = "",
         article_topic_cluster: str = "",
-        article_title: str = "",
-        article_slug: str = "",
-        _fetcher=None,              # injectable for tests
-        _registry=None,             # injectable for tests
+        article_title:         str = "",
+        article_slug:          str = "",
+        _provider=None,     # injectable for tests
+        _registry=None,     # injectable for tests
     ):
         self._keyword  = article_keyword
         self._cluster  = article_topic_cluster
         self._title    = article_title
-        self._slug     = article_slug
+        self._slug     = article_slug or re.sub(r"[^a-z0-9\-]", "-", article_title.lower())[:60]
 
-        # Resolve topic category once at init
+        # Topic category drives prompt generation and provider queries
         self._topic_category: str = route(article_keyword, article_topic_cluster)
 
-        # Registry — singleton (loaded from Sheets at startup)
+        # Registry — singleton (Sheets-backed)
         self._registry: ImageRegistry = _registry if _registry is not None else get_registry()
 
-        # Pexels client — injectable for tests
-        self._fetcher = _fetcher if _fetcher is not None else get_pexels_client()
+        # Image provider — injectable for tests
+        self._provider = _provider if _provider is not None else get_provider()
 
         # Per-post state
         self._used_urls:     set  = set()
@@ -193,92 +167,47 @@ class ImageSelectionService:
         log.info(
             f"[IMAGE_ROUTE] article='{article_title[:60]}'  "
             f"keyword='{article_keyword}'  cluster='{article_topic_cluster}'  "
-            f"topic_category='{self._topic_category}'"
+            f"topic_category='{self._topic_category}'  "
+            f"provider='{self._provider.name}'"
         )
 
     # ── Internal: record a selection locally ─────────────────────────────────
 
     def _record(self, sel: ImageSelection) -> None:
-        """Commit selection to local post state. Does NOT write to Sheets."""
+        """Register selection to local post state (no Sheets write yet)."""
         self._used_urls.add(sel.url)
         self._used_clusters.add(sel.visual_cluster)
         self._selections.append(sel)
 
-    # ── Dynamic section / hero selection (Pexels API) ─────────────────────────
+    # ── Internal: get image from provider + check dedup ──────────────────────
 
-    def _select_dynamic(self, context: str, role: str) -> "str | None":
+    def _fetch_image(
+        self,
+        role: str,
+        context: str,
+        paragraph_snippet: str = "",
+    ) -> "ImageAsset | None":
         """
-        Fetch and select an image from Pexels API for section or hero role.
-
-        Returns URL string or None.
-        None means no relevant image found — slot is silently skipped.
+        Generate a prompt, call the provider, check dedup, return ImageAsset or None.
         """
-        queries = get_search_queries(
-            self._topic_category,
-            self._keyword,
-            section_heading=context,
+        prompt = generate_prompt(
+            role             = role,
+            keyword          = self._keyword,
+            topic_category   = self._topic_category,
+            section_heading  = context if role == ROLE_SECTION else "",
+            paragraph_snippet= paragraph_snippet,
+            article_title    = self._title if role == ROLE_HERO else "",
         )
 
-        log.info(
-            f"[IMAGE_FETCHER] role={role}  "
-            f"topic='{self._topic_category}'  "
-            f"queries={queries}  "
-            f"context='{context[:60]}'"
+        asset = self._provider.get_image(
+            prompt       = prompt,
+            article_slug = self._slug,
+            slot_name    = f"{role}_{self._section_count}" if role == ROLE_SECTION else role,
+            registry     = self._registry,
+            used_urls    = self._used_urls,
         )
 
-        candidates = fetch_and_score(
-            queries         = queries,
-            context         = context,
-            keyword         = self._keyword,
-            topic_category  = self._topic_category,
-            registry        = self._registry,
-            used_urls       = self._used_urls,
-            used_clusters   = self._used_clusters,
-            client          = self._fetcher,
-        )
-
-        if not candidates:
-            log.info(
-                f"[IMAGE_SKIPPED] role={role}  "
-                f"reason=NO_RELEVANT_IMAGE_FOUND  "
-                f"context='{context[:60]}'"
-            )
-            return None
-
-        score, best = candidates[0]
-
-        # Prefer visual cluster diversity within the post
-        # If best uses a cluster already used, try second-best unless score gap is large
-        if len(candidates) > 1 and best.visual_cluster in self._used_clusters:
-            for alt_score, alt in candidates[1:]:
-                if alt.visual_cluster not in self._used_clusters:
-                    # Accept the alternative if its score is within 20% of best
-                    if alt_score >= score * 0.80:
-                        score, best = alt_score, alt
-                    break
-
-        sel = ImageSelection(
-            image_id       = best.image_id,
-            url            = best.url,
-            role           = role,
-            category       = self._topic_category,
-            visual_cluster = best.visual_cluster,
-            relevance_score= score,
-            context        = context,
-            source         = "pexels_api",
-            search_query   = best.search_query,
-        )
-        self._record(sel)
-
-        log.info(
-            f"[IMAGE_SELECTED] role={role}  "
-            f"id={best.image_id}  "
-            f"score={score:.4f}  "
-            f"cluster={best.visual_cluster}  "
-            f"alt='{best.alt[:60]}'  "
-            f"url={best.url[:80]}"
-        )
-        return best.url
+        return asset
 
     # ── Public selection API ──────────────────────────────────────────────────
 
@@ -286,17 +215,47 @@ class ImageSelectionService:
         """
         Select hero image for the article.
 
-        Returns URL string or None (if no relevant image found).
-        Hero is omitted rather than filled with a weak/irrelevant image.
+        Uses AI generation or Pexels — NEVER static catalog.
+        Returns URL or None (section skipped gracefully).
         """
-        return self._select_dynamic(context or self._keyword, ROLE_HERO)
+        asset = self._fetch_image(ROLE_HERO, context or self._keyword)
 
-    def section(self, context: str = "", index: int = 0) -> "str | None":
+        if asset is None:
+            log.info(
+                f"[IMAGE_SKIPPED] role=hero  "
+                f"reason=NO_IMAGE_RETURNED_BY_PROVIDER_{self._provider.name.upper()}  "
+                f"topic='{self._topic_category}'"
+            )
+            return None
+
+        sel = ImageSelection(
+            image_id        = asset.image_id,
+            url             = asset.url,
+            role            = ROLE_HERO,
+            category        = self._topic_category,
+            visual_cluster  = asset.visual_cluster,
+            relevance_score = 1.0,
+            context         = context,
+            source          = asset.provider,
+            search_query    = asset.search_query,
+            prompt_hash     = asset.prompt_hash,
+            provider_id     = asset.provider_id,
+        )
+        self._record(sel)
+        return asset.url
+
+    def section(
+        self,
+        context: str = "",
+        index: int = 0,
+        paragraph_snippet: str = "",
+    ) -> "str | None":
         """
         Select section image for the given heading/context.
 
-        Returns URL string or None. None means: no relevant image found for
-        this section — the slot is silently skipped. Article still publishes.
+        Uses AI generation or Pexels — NEVER static catalog.
+        Returns URL or None. None means: no relevant image found.
+        Article still publishes.
 
         Max MAX_SECTION_IMAGES per article.
         """
@@ -308,72 +267,88 @@ class ImageSelectionService:
             )
             return None
 
-        url = self._select_dynamic(context, ROLE_SECTION)
-        if url:
-            self._section_count += 1
-        return url
+        asset = self._fetch_image(ROLE_SECTION, context, paragraph_snippet)
+
+        if asset is None:
+            log.info(
+                f"[IMAGE_SKIPPED] role=section  "
+                f"reason=NO_RELEVANT_IMAGE_FOUND  "
+                f"context='{context[:60]}'"
+            )
+            return None
+
+        sel = ImageSelection(
+            image_id        = asset.image_id,
+            url             = asset.url,
+            role            = ROLE_SECTION,
+            category        = self._topic_category,
+            visual_cluster  = asset.visual_cluster,
+            relevance_score = 1.0,
+            context         = context,
+            source          = asset.provider,
+            search_query    = asset.search_query,
+            prompt_hash     = asset.prompt_hash,
+            provider_id     = asset.provider_id,
+        )
+        self._record(sel)
+        self._section_count += 1
+        return asset.url
 
     def cta(self, slot: int = 0) -> str:
         """
-        Select CTA image for the given slot index from the static catalog.
+        Select CTA image from the static catalog.
 
-        Never returns None — always provides an image for CTA blocks.
-        CTA images are reusable across posts (reusable_cta=True).
-        Rotates within-post to avoid duplicate CTA images in the same article.
+        Always returns a URL — CTA images are mandatory decorative blocks.
+        Uses ONLY static catalog (reusable_cta=True images).
+        NEVER uses AI or Pexels for CTA blocks.
+        Rotates to avoid within-post duplicates.
         """
-        cta_pool = get_approved(role=ROLE_CTA, reusable_cta=True)
+        cta_pool  = get_approved(role=ROLE_CTA, reusable_cta=True)
         survivors = []
 
         for entry in cta_pool:
-            # Skip URLs already used in this post
             if entry.url in self._used_urls:
                 continue
-
-            passed, reason, score = _evaluate_cta_gates(
-                entry, self._used_clusters, self._registry
-            )
+            passed, reason, score = _evaluate_cta_gates(entry)
             if passed:
                 survivors.append((score, entry))
-            else:
-                log.debug(f"[IMAGE_REJECTED_CTA] id={entry.image_id} reason={reason}")
 
         if survivors:
-            survivors.sort(key=lambda x: -x[0])
-            score, best = survivors[0]
-
+            _, best = max(survivors, key=lambda x: x[0])
             sel = ImageSelection(
-                image_id       = best.image_id,
-                url            = best.url,
-                role           = ROLE_CTA,
-                category       = best.category,
-                visual_cluster = best.visual_cluster,
-                relevance_score= score,
-                context        = f"cta_slot_{slot}",
-                source         = "static_catalog",
-                search_query   = "",
+                image_id        = best.image_id,
+                url             = best.url,
+                role            = ROLE_CTA,
+                category        = best.category,
+                visual_cluster  = best.visual_cluster,
+                relevance_score = 1.0,
+                context         = f"cta_slot_{slot}",
+                source          = "static_catalog",
+                search_query    = "",
+                prompt_hash     = "",
+                provider_id     = best.image_id,
             )
             self._record(sel)
-
             log.info(
                 f"[IMAGE_SELECTED] role=cta  "
-                f"id={best.image_id}  "
-                f"slot={slot}  "
+                f"id={best.image_id}  slot={slot}  "
                 f"url={best.url[:80]}"
             )
             return best.url
 
-        # Hard fallback — should not happen with a correct catalog (3+ CTA images)
+        # Hard fallback: force-cycle through pool if all used
         if cta_pool:
             fallback = cta_pool[slot % len(cta_pool)]
             log.warning(
                 f"[IMAGE_SKIPPED] CTA slot={slot} pool exhausted — "
                 f"force-cycling to {fallback.image_id}"
             )
-            self._used_urls.discard(fallback.url)  # allow reuse as last resort
-            return self.cta(slot)   # retry with cleared URL
+            # Temporarily allow reuse for this CTA slot
+            self._used_urls.discard(fallback.url)
+            return self.cta(slot)
 
         raise RuntimeError(
-            "CTA pool is empty — add at least 3 approved CTA images to IMAGE_CATALOG"
+            "CTA catalog is empty — add at least 3 approved CTA images to IMAGE_CATALOG"
         )
 
     # ── Registry commit ───────────────────────────────────────────────────────
@@ -389,11 +364,9 @@ class ImageSelectionService:
         Write all selections for this post to the Sheets registry.
 
         Call ONLY after:
-          1. All image selection is complete.
-          2. Pre-publish validation has passed.
-          3. HubSpot API call succeeded (or DRY_RUN).
-
-        Writes are one-way and permanent. Never call during selection.
+          1. All image selection complete.
+          2. Pre-publish validation passed.
+          3. HubSpot API POST succeeded (or DRY_RUN).
         """
         if not self._selections:
             log.info(f"[IMAGE_REGISTRY_WRITTEN] No selections to commit for '{post_slug}'")
@@ -417,6 +390,8 @@ class ImageSelectionService:
                 search_query         = sel.search_query,
                 image_source         = sel.source,
                 relevance_score      = sel.relevance_score,
+                prompt_used          = sel.prompt_hash,
+                provider_image_id    = sel.provider_id,
                 selected_at          = ts,
             ))
 
@@ -429,15 +404,13 @@ class ImageSelectionService:
         """
         Summary for publisher.py logging and hubspot.json 'images' field.
 
-        'unverified_ids' now only flags static-catalog images whose IDs are not
-        in APPROVED_IDS. Pexels API images are always considered verified
-        (they came from our authenticated API request).
+        'unverified_ids' only flags static catalog images not in APPROVED_IDS.
+        AI-generated and Pexels images are always considered verified.
         """
         all_ids  = [s.image_id for s in self._selections]
         counts   = Counter(all_ids)
         dupes    = [i for i, n in counts.items() if n > 1]
 
-        # Only flag static catalog images as unverified (pexels_api images are safe)
         unverif = [
             s.image_id for s in self._selections
             if s.source == "static_catalog" and s.image_id not in APPROVED_IDS
@@ -451,10 +424,11 @@ class ImageSelectionService:
             "duplicate_ids":       dupes or "none",
             "unverified_ids":      unverif or "none",
             "topic_category":      self._topic_category,
+            "provider":            self._provider.name,
             "selections": [
                 {
                     "role":           s.role,
-                    "id":             s.image_id,
+                    "id":             s.image_id[:16],
                     "category":       s.category,
                     "visual_cluster": s.visual_cluster,
                     "score":          round(s.relevance_score, 4),

@@ -61,6 +61,7 @@ HEADER_ROW = [
     "image_id", "image_url", "image_type", "category",
     "visual_cluster", "selected_for_section",
     "search_query", "image_source", "relevance_score",
+    "prompt_used", "provider_image_id",
     "selected_at",
 ]
 
@@ -86,9 +87,11 @@ class RegistryEntry:
     category: str
     visual_cluster: str
     selected_for_section: str  # section heading text (or "" for hero/cta)
-    search_query: str          # Pexels search query used (or "" for static catalog)
-    image_source: str          # "pexels_api" | "static_catalog"
+    search_query: str          # Pexels search query used (or "" for AI/static)
+    image_source: str          # "openai" | "pexels" | "static_catalog"
     relevance_score: float     # composite score assigned at selection time
+    prompt_used: str           # sha256[:16] of DALL-E prompt (or "" for Pexels/static)
+    provider_image_id: str     # provider's own ID (HubSpot file ID, Pexels photo ID)
     selected_at: str           # UTC timestamp string
 
     def to_row(self) -> list:
@@ -99,6 +102,7 @@ class RegistryEntry:
             self.selected_for_section,
             self.search_query, self.image_source,
             str(round(self.relevance_score, 4)),
+            self.prompt_used, self.provider_image_id,
             self.selected_at,
         ]
 
@@ -191,6 +195,8 @@ class ImageRegistry:
                         search_query         = str(row.get("search_query", "")),
                         image_source         = str(row.get("image_source", "static_catalog")),
                         relevance_score      = rel_score,
+                        prompt_used          = str(row.get("prompt_used", "")),
+                        provider_image_id    = str(row.get("provider_image_id", "")),
                         selected_at          = str(row.get("selected_at", "")),
                     )
                     self._entries.append(entry)
