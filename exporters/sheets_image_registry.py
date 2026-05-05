@@ -108,11 +108,13 @@ class SheetsImageRegistry:
                 self._ws.update("A1", [_HEADER_ROW])
                 log.info(f"[ImageRegistry] Created '{TAB_NAME}' tab in Google Sheet")
 
-            # Load all rows
+            # Load all rows — only section images count for global dedup.
+            # CTA images are decorative and freely reused across posts.
             all_rows = self._ws.get_all_records()
             for row in all_rows:
-                img_id = str(row.get("Image ID", "")).strip()
-                if img_id:
+                img_id   = str(row.get("Image ID", "")).strip()
+                img_type = str(row.get("Type", "section")).strip().lower()
+                if img_id and img_type != "cta":
                     self._used_ids.add(img_id)
 
             self._connected = True

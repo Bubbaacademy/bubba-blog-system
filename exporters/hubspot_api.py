@@ -532,18 +532,30 @@ class HubSpotAPIExporter(BaseExporter):
             img_urls_used = re.findall(r'src="(https://[^"]+pexels[^"]+)"', body_for_imgs)
             slug_for_reg  = hs_data.get("post", {}).get("slug", "unknown")
 
-            # Build per-image entries with type (section vs cta)
-            # CTA images appear inside data-cta-type blocks; others are section images.
+            # Identify CTA vs section images by container class.
+            # _img_tag() in hubspot.py wraps every image in:
+            #   <div class="hs-blog-image hs-blog-image--{type}">
+            #     <img src="..." class="hs-cta-image OR hs-blog-image" .../>
+            #   </div>
+            # The data-cta-type div comes AFTER the img tag, so matching backwards
+            # from that div is unreliable. Match the container class instead.
             cta_block_ids = set(
                 m.group(1)
                 for m in (
                     re.search(r'/photos/(\d+)/', u)
                     for u in re.findall(
-                        r'data-cta-type="[^"]*"[^<]*<[^>]*src="(https://[^"]+pexels[^"]+)"',
+                        r'<div class="hs-blog-image hs-blog-image--cta">\s*'
+                        r'<img\s[^>]*src="(https://[^"]+pexels[^"]+)"',
                         body_for_imgs,
+                        re.DOTALL,
                     )
                 )
                 if m
+            )
+
+            log.info(
+                f"     [ImageRegistry] CTA image IDs detected in postBody: "
+                f"{sorted(cta_block_ids) or 'none'}"
             )
 
             entries = []

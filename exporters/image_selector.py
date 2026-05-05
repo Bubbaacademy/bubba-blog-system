@@ -661,6 +661,21 @@ class ImageTracker:
         """
         passed = []
 
+        # ── Debug: show dedup state before scoring ────────────────────────────
+        globally_used_in_pool = (
+            [e[0] for e in pool if self._registry.is_globally_used(e[0])]
+            if check_global else []
+        )
+        locally_used_in_pool = [e[0] for e in pool if _url(e[0]) in self._used_urls]
+        log.info(
+            f"[IMAGE_DEDUP] category={image_category or 'cta'}  "
+            f"pool_size={len(pool)}  "
+            f"globally_used_ids={globally_used_in_pool or 'none'}  "
+            f"locally_used_ids={locally_used_in_pool or 'none'}  "
+            f"candidates_after_filter="
+            f"{len(pool) - len(globally_used_in_pool) - len([x for x in locally_used_in_pool if x not in globally_used_in_pool])}"
+        )
+
         for entry in pool:
             photo_id = entry[0]
             url      = _url(photo_id)
@@ -669,7 +684,8 @@ class ImageTracker:
                 log.debug(f"[IMAGE] {photo_id} — local dedup skip")
                 continue
             if check_global and self._registry.is_globally_used(photo_id):
-                log.debug(f"[IMAGE] {photo_id} — global dedup skip")
+                log.info(f"[IMAGE_REJECTED_GLOBAL_DUPLICATE] id={photo_id}  "
+                         f"reason=previously used in another post")
                 continue
 
             approved, reason, score = _validate_candidate(
