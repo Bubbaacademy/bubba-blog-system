@@ -3,53 +3,40 @@ image_selector.py — ImageSelectionService: per-post image selection engine.
 
 ARCHITECTURE
 ------------
-This module is the only public entry point for image selection.
-All other image modules are consumed internally — callers only import this file.
+Two image sources, one selector:
 
-Public API
+  A. Section / Hero images — fetched DYNAMICALLY from Pexels API
+     ─────────────────────────────────────────────────────────────
+     1. Route keyword+cluster → topic_category
+     2. Generate topic-specific search queries (image_router.get_search_queries)
+     3. Fetch candidates from Pexels API (image_fetcher.fetch_and_score)
+     4. Apply gates: global dedup, blocked tags, topic negative terms, min score
+     5. Pick highest-scoring candidate. None if nothing passes.
+     6. No fallback — article publishes without section images when None.
+
+  B. CTA images — from STATIC CATALOG (image_catalog.py)
+     ─────────────────────────────────────────────────────
+     1. Load approved CTA entries (reusable_cta=True)
+     2. Apply gates 1–6 from the static pipeline
+     3. Rotate through CTA pool to avoid within-post duplicates
+     4. CTA images are reusable across posts (never in global dedup set)
+
+PUBLIC API
 ----------
     service = ImageSelectionService(keyword, topic_cluster, title, slug)
-    hero_url    = service.hero(article_intro_text)       # str | None
-    section_url = service.section(heading_text, index)   # str | None
-    cta_url     = service.cta(slot)                      # str (never None)
-
-    # After validation passes (called from hubspot_api.py):
+    hero_url    = service.hero(article_intro_text)      # str | None
+    section_url = service.section(heading_text, index)  # str | None
+    cta_url     = service.cta(slot)                     # str (never None)
+    # After validation + API success:
     service.commit(post_slug, post_title, keyword, topic_cluster)
-
-    # Expose for publisher.py log and hubspot.json:
     report = service.validation_report()
-
-SELECTION PIPELINE (per image slot)
--------------------------------------
-  1. Build candidate pool from IMAGE_CATALOG (approved status, correct role).
-  2. Filter by allowed_categories (from image_router.route()).
-  3. Score each candidate through gates:
-       Gate 1  status == approved
-       Gate 2  quality_score >= QUALITY_THRESHOLD
-       Gate 3  no BLOCKED_TAGS in tags
-       Gate 4  no BLOCKED_DESCRIPTION_WORDS in description
-       Gate 5  category in allowed_categories  (skipped for CTA)
-       Gate 6  topic not in blocked_topic_clusters
-       Gate 7  not globally used in prior post  (skipped for CTA)
-       Gate 8  tag_recall >= TAG_RECALL_FLOOR   (skipped for CTA)
-       Gate 9  desc_recall >= DESC_RECALL_FLOOR (skipped for CTA)
-       Gate 10 final_score >= RELEVANCE_THRESHOLD (skipped for CTA)
-  4. Sort survivors by score descending. Pick best.
-  5. Commit winner to local state (url, visual_cluster).
-  6. Log [IMAGE_SELECTED].
 
 COMMIT FLOW
 -----------
-  commit() is called ONCE from hubspot_api.py AFTER:
-    • validate_post_package() passes
-    • HubSpot API POST succeeds (or DRY_RUN)
-  commit() writes RegistryEntry rows to Google Sheets.
-  During selection, no Sheets writes occur.
-
-REUSE IN OTHER PROJECTS
------------------------
-Replace image_catalog, image_router, and image_policy with project-specific
-versions. ImageSelectionService logic is fully generic.
+commit() is called ONCE from hubspot_api.py AFTER:
+  • validate_post_package() passes
+  • HubSpot API POST succeeds (or DRY_RUN)
+During selection, no Sheets writes occur.
 """
 from __future__ import annotations
 
@@ -58,6 +45,7 @@ import datetime
 import logging
 from dataclasses import dataclass, field
 from collections import Counter
+from typing import Optional
 
 from exporters.image_policy import (
     BLOCKED_TAGS, BLOCKED_DESCRIPTION_WORDS, NOISE_TAGS, STOPWORDS,
@@ -69,19 +57,39 @@ from exporters.image_policy import (
     MAX_SECTION_IMAGES,
 )
 from exporters.image_catalog import (
-    ImageEntry, IMAGE_CATALOG, APPROVED_IDS, get_approved, get_by_id,
-    # backward-compat alias used by hubspot_api.py
-    APPROVED_PEXELS_IDS,
+    ImageEntry, IMAGE_CATALOG, get_approved,
+    APPROVED_IDS, APPROVED_PEXELS_IDS,
 )
-from exporters.image_router import route
+from exporters.image_router import route, get_search_queries
 from exporters.image_registry import get_registry, RegistryEntry, ImageRegistry
+from exporters.image_fetcher import (
+    FetchedImage, fetch_and_score, get_pexels_client,
+)
 import exporters.image_logging as ilog
 
 log = logging.getLogger("image_selector")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
+# ImageSelection — result object for one selected image
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ImageSelection:
+    """Immutable record of a single image selection decision."""
+    image_id:        str
+    url:             str
+    role:            str         # hero / section / cta
+    category:        str
+    visual_cluster:  str
+    relevance_score: float
+    context:         str         # section heading or "" for hero/cta
+    source:          str         # "pexels_api" | "static_catalog"
+    search_query:    str         # Pexels query that found this image (or "" for static)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Static catalog gate evaluator (used for CTA images only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _clean_words(text: str) -> set:
@@ -92,166 +100,43 @@ def _meaningful_words(text: str) -> set:
     return _clean_words(text) - STOPWORDS
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ImageSelection result object
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class ImageSelection:
-    """Immutable record of a single image selection decision."""
-    image_id:       str
-    url:            str
-    role:           str       # hero / section / cta
-    category:       str
-    visual_cluster: str
-    relevance_score: float
-    context:        str       # section heading, "" for hero/cta
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Gate evaluator
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _evaluate_gates(
+def _evaluate_cta_gates(
     entry: ImageEntry,
-    context: str,
-    keyword: str,
-    topic_cluster: str,
     used_clusters_this_post: set,
-    allowed_categories: list,
     registry: ImageRegistry,
-    role: str,
 ) -> tuple:
     """
-    Run a catalog entry through all selection gates.
+    Run a static catalog CTA entry through its gates.
 
-    Returns
-    -------
-    (passed: bool, rejection_reason: str, score: float, matched_keywords: list)
+    Gates for CTA (decorative, topic-independent):
+      1  status == approved
+      2  quality_score >= QUALITY_THRESHOLD
+      3  no BLOCKED_TAGS in tags
+      4  no BLOCKED_DESCRIPTION_WORDS in description
+      5  reusable_cta=True (CTA images only — enforced upstream in .cta())
+
+    Returns (passed: bool, reason: str, score: float)
+    CTA score is always 1.0 if it passes — they're decorative, not relevance-scored.
     """
     pid = entry.image_id
 
-    # ── Gate 1: status ────────────────────────────────────────────────────────
     if not entry.is_approved():
-        return False, f"REJECTED_DISABLED:status={entry.status}", 0.0, []
+        return False, f"REJECTED_DISABLED:status={entry.status}", 0.0
 
-    # ── Gate 2: quality ───────────────────────────────────────────────────────
     if entry.quality_score < QUALITY_THRESHOLD:
-        return (
-            False,
-            f"REJECTED_LOW_QUALITY:quality={entry.quality_score:.2f}<{QUALITY_THRESHOLD}",
-            0.0, [],
-        )
+        return False, f"REJECTED_LOW_QUALITY:{entry.quality_score:.2f}<{QUALITY_THRESHOLD}", 0.0
 
-    # ── Gate 3: blocked tags ──────────────────────────────────────────────────
-    tags_lower  = {t.lower() for t in entry.tags}
-    blocked_tag = tags_lower & BLOCKED_TAGS
-    if blocked_tag:
-        return False, f"REJECTED_BLOCKED_TAG:{sorted(blocked_tag)}", 0.0, []
+    tags_lower = {t.lower() for t in entry.tags}
+    hit = tags_lower & BLOCKED_TAGS
+    if hit:
+        return False, f"REJECTED_BLOCKED_TAG:{sorted(hit)}", 0.0
 
-    # ── Gate 4: blocked description words ────────────────────────────────────
-    desc_raw_words = set(entry.description.lower().split())
-    blocked_desc   = desc_raw_words & BLOCKED_DESCRIPTION_WORDS
-    if blocked_desc:
-        return False, f"REJECTED_BLOCKED_DESCRIPTION:{sorted(blocked_desc)}", 0.0, []
+    desc_words = set(entry.description.lower().split())
+    hit2 = desc_words & BLOCKED_DESCRIPTION_WORDS
+    if hit2:
+        return False, f"REJECTED_BLOCKED_DESCRIPTION:{sorted(hit2)}", 0.0
 
-    # ── Gate 5: category match (section/hero only) ────────────────────────────
-    if role != ROLE_CTA and allowed_categories and entry.category not in allowed_categories:
-        return (
-            False,
-            f"REJECTED_CATEGORY_MISMATCH:{entry.category} not in {allowed_categories}",
-            0.0, [],
-        )
-
-    # ── Gate 6: blocked topic cluster ────────────────────────────────────────
-    if entry.is_blocked_for_topic(keyword, topic_cluster):
-        blocked_match = next(
-            (b for b in entry.blocked_topic_clusters
-             if b.lower() in f"{keyword} {topic_cluster}".lower()),
-            "unknown",
-        )
-        return False, f"REJECTED_BLOCKED_TOPIC:{blocked_match}", 0.0, []
-
-    # ── CTA: skip scoring gates — decorative, topic-independent ──────────────
-    if role == ROLE_CTA:
-        return True, "APPROVED_CTA:gates_1_to_6_passed", 1.0, []
-
-    # ── Gate 7: global dedup (section + hero) ─────────────────────────────────
-    if registry.is_globally_used(pid):
-        return False, "REJECTED_GLOBAL_DUPLICATE:used_in_prior_post", 0.0, []
-
-    # ── Gates 8–10: semantic relevance scoring ────────────────────────────────
-    full_ctx       = f"{context} {keyword} {topic_cluster}"
-    ctx_meaningful = _meaningful_words(full_ctx)
-    ctx_size       = max(len(ctx_meaningful), 1)
-
-    kw_words   = _clean_words(" ".join(entry.relevance_keywords))
-    tag_words  = _clean_words(" ".join(entry.tags))
-    desc_words = _clean_words(entry.description)
-
-    kw_recall   = len(kw_words   & ctx_meaningful) / ctx_size
-    tag_recall  = len(tag_words  & ctx_meaningful) / ctx_size
-    desc_recall = len(desc_words & ctx_meaningful) / ctx_size
-
-    # Gate 8
-    if tag_recall < TAG_RECALL_FLOOR:
-        return (
-            False,
-            f"REJECTED_LOW_TAG_RECALL:tag_recall={tag_recall:.4f}<{TAG_RECALL_FLOOR}  "
-            f"ctx_size={ctx_size}",
-            0.0, [],
-        )
-
-    # Gate 9
-    if desc_recall < DESC_RECALL_FLOOR:
-        return (
-            False,
-            f"REJECTED_LOW_DESC_RECALL:desc_recall={desc_recall:.4f}<{DESC_RECALL_FLOOR}  "
-            f"ctx_size={ctx_size}",
-            0.0, [],
-        )
-
-    # Composite base score
-    base_score = kw_recall * 0.40 + tag_recall * 0.35 + desc_recall * 0.25
-
-    # Anti-corruption: noise tag penalty
-    noise_count   = len(tags_lower & NOISE_TAGS)
-    noise_penalty = min(MAX_NOISE_PENALTY, noise_count * NOISE_PENALTY)
-
-    # Within-post visual diversity penalty
-    cluster_penalty = (
-        VISUAL_CLUSTER_PENALTY if entry.visual_cluster in used_clusters_this_post
-        else 0.0
-    )
-
-    # Cross-post visual diversity penalty (softer — reduces score, not hard gate)
-    cross_usage       = registry.get_cluster_usage_count(entry.visual_cluster)
-    cross_penalty     = min(MAX_CROSS_POST_CLUSTER_PENALTY,
-                            cross_usage * CROSS_POST_CLUSTER_PENALTY_PER_USE)
-
-    # Quality multiplier: better images score higher on the same content
-    final_score = round(
-        (base_score - noise_penalty - cluster_penalty - cross_penalty)
-        * entry.quality_score,
-        4,
-    )
-
-    matched_kws = sorted((kw_words | tag_words | desc_words) & ctx_meaningful)
-
-    # Gate 10
-    if final_score < RELEVANCE_THRESHOLD:
-        return (
-            False,
-            f"REJECTED_LOW_RELEVANCE:score={final_score:.4f}<{RELEVANCE_THRESHOLD}  "
-            f"(base={base_score:.4f}  noise=-{noise_penalty:.2f}  "
-            f"cluster_penalty=-{cluster_penalty:.2f}  "
-            f"cross_penalty=-{cross_penalty:.2f}  "
-            f"quality×{entry.quality_score})",
-            final_score,
-            matched_kws,
-        )
-
-    return True, f"APPROVED:score={final_score:.4f}", final_score, matched_kws
+    return True, "APPROVED_CTA", 1.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,8 +147,9 @@ class ImageSelectionService:
     """
     Per-post image selection service.
 
-    One instance per article. Holds all selection state for that article.
-    Thread-safe for sequential use (one post at a time per process).
+    One instance per article. Two image sources:
+    - Dynamic Pexels API for section + hero (topic-relevant, globally deduped)
+    - Static catalog for CTA (brand-consistent, reusable across posts)
 
     Usage
     -----
@@ -281,101 +167,118 @@ class ImageSelectionService:
         article_topic_cluster: str = "",
         article_title: str = "",
         article_slug: str = "",
+        _fetcher=None,              # injectable for tests
+        _registry=None,             # injectable for tests
     ):
         self._keyword  = article_keyword
         self._cluster  = article_topic_cluster
         self._title    = article_title
         self._slug     = article_slug
 
-        # Load registry once per service instance.
-        # Registry was loaded from Sheets at startup via get_registry() singleton.
-        self._registry: ImageRegistry = get_registry()
+        # Resolve topic category once at init
+        self._topic_category: str = route(article_keyword, article_topic_cluster)
 
-        # Per-post state — reset for each new article
-        self._used_urls:   set  = set()
-        self._used_clusters: set = set()
-        self._selections:  list  = []   # list[ImageSelection]
-        self._section_count: int = 0
+        # Registry — singleton (loaded from Sheets at startup)
+        self._registry: ImageRegistry = _registry if _registry is not None else get_registry()
 
-        # Resolve allowed categories once at init (from image_router)
-        self._allowed_categories: list = route(article_keyword, article_topic_cluster)
+        # Pexels client — injectable for tests
+        self._fetcher = _fetcher if _fetcher is not None else get_pexels_client()
+
+        # Per-post state
+        self._used_urls:     set  = set()
+        self._used_clusters: set  = set()
+        self._selections:    list = []   # list[ImageSelection]
+        self._section_count: int  = 0
 
         log.info(
-            f"[IMAGE_ROUTE] article='{article_title}'  "
+            f"[IMAGE_ROUTE] article='{article_title[:60]}'  "
             f"keyword='{article_keyword}'  cluster='{article_topic_cluster}'  "
-            f"allowed_categories={self._allowed_categories or 'NONE (topic has no image category)'}"
+            f"topic_category='{self._topic_category}'"
         )
 
-    # ── Internal: score a pool ────────────────────────────────────────────────
+    # ── Internal: record a selection locally ─────────────────────────────────
 
-    def _score_pool(
-        self,
-        pool: list,
-        context: str,
-        role: str,
-        allowed_categories: list,
-    ) -> list:
-        """
-        Score every candidate in pool, log each decision, return sorted survivors.
-
-        Returns list of (score, matched_keywords, entry) sorted by score descending.
-        """
-        survivors = []
-        stats = {
-            "globally_used": 0, "category_mismatch": 0, "blocked": 0,
-            "low_quality": 0, "low_relevance": 0, "approved": 0,
-        }
-
-        for entry in pool:
-            # Local dedup — skip URLs already committed in this post
-            if entry.url in self._used_urls:
-                log.debug(f"[IMAGE] {entry.image_id} local-dedup skip")
-                continue
-
-            passed, reason, score, matched_kws = _evaluate_gates(
-                entry, context, self._keyword, self._cluster,
-                self._used_clusters, allowed_categories,
-                self._registry, role,
-            )
-
-            if passed:
-                survivors.append((score, matched_kws, entry))
-                stats["approved"] += 1
-                ilog.log_approved(
-                    entry.image_id, entry.category, entry.visual_cluster,
-                    score, context, matched_kws,
-                )
-            else:
-                ilog.log_rejected(entry.image_id, reason, score, context)
-                if "DUPLICATE" in reason:
-                    stats["globally_used"] += 1
-                elif "CATEGORY" in reason or "TOPIC" in reason:
-                    stats["category_mismatch"] += 1
-                elif "BLOCKED" in reason:
-                    stats["blocked"] += 1
-                elif "QUALITY" in reason or "DISABLED" in reason:
-                    stats["low_quality"] += 1
-                else:
-                    stats["low_relevance"] += 1
-
-        survivors.sort(key=lambda x: -x[0])
-
-        ilog.log_pool_summary(
-            context, role, len(pool),
-            stats["globally_used"], stats["category_mismatch"],
-            stats["blocked"], stats["low_quality"], stats["low_relevance"],
-            stats["approved"],
-        )
-
-        return survivors
-
-    # ── Internal: commit a winner locally ────────────────────────────────────
-
-    def _record(self, selection: ImageSelection) -> None:
+    def _record(self, sel: ImageSelection) -> None:
         """Commit selection to local post state. Does NOT write to Sheets."""
-        self._used_urls.add(selection.url)
-        self._used_clusters.add(selection.visual_cluster)
-        self._selections.append(selection)
+        self._used_urls.add(sel.url)
+        self._used_clusters.add(sel.visual_cluster)
+        self._selections.append(sel)
+
+    # ── Dynamic section / hero selection (Pexels API) ─────────────────────────
+
+    def _select_dynamic(self, context: str, role: str) -> "str | None":
+        """
+        Fetch and select an image from Pexels API for section or hero role.
+
+        Returns URL string or None.
+        None means no relevant image found — slot is silently skipped.
+        """
+        queries = get_search_queries(
+            self._topic_category,
+            self._keyword,
+            section_heading=context,
+        )
+
+        log.info(
+            f"[IMAGE_FETCHER] role={role}  "
+            f"topic='{self._topic_category}'  "
+            f"queries={queries}  "
+            f"context='{context[:60]}'"
+        )
+
+        candidates = fetch_and_score(
+            queries         = queries,
+            context         = context,
+            keyword         = self._keyword,
+            topic_category  = self._topic_category,
+            registry        = self._registry,
+            used_urls       = self._used_urls,
+            used_clusters   = self._used_clusters,
+            client          = self._fetcher,
+        )
+
+        if not candidates:
+            log.info(
+                f"[IMAGE_SKIPPED] role={role}  "
+                f"reason=NO_RELEVANT_IMAGE_FOUND  "
+                f"context='{context[:60]}'"
+            )
+            return None
+
+        score, best = candidates[0]
+
+        # Prefer visual cluster diversity within the post
+        # If best uses a cluster already used, try second-best unless score gap is large
+        if len(candidates) > 1 and best.visual_cluster in self._used_clusters:
+            for alt_score, alt in candidates[1:]:
+                if alt.visual_cluster not in self._used_clusters:
+                    # Accept the alternative if its score is within 20% of best
+                    if alt_score >= score * 0.80:
+                        score, best = alt_score, alt
+                    break
+
+        sel = ImageSelection(
+            image_id       = best.image_id,
+            url            = best.url,
+            role           = role,
+            category       = self._topic_category,
+            visual_cluster = best.visual_cluster,
+            relevance_score= score,
+            context        = context,
+            source         = "pexels_api",
+            search_query   = best.search_query,
+        )
+        self._record(sel)
+
+        log.info(
+            f"[IMAGE_SELECTED] role={role}  "
+            f"id={best.image_id}  "
+            f"score={score:.4f}  "
+            f"cluster={best.visual_cluster}  "
+            f"alt='{best.alt[:60]}'  "
+            f"url={best.url[:80]}"
+        )
+        return best.url
 
     # ── Public selection API ──────────────────────────────────────────────────
 
@@ -383,115 +286,91 @@ class ImageSelectionService:
         """
         Select hero image for the article.
 
-        Returns URL string or None (if no relevant image exists).
+        Returns URL string or None (if no relevant image found).
         Hero is omitted rather than filled with a weak/irrelevant image.
-        Called at most once per article.
         """
-        if not self._allowed_categories:
-            ilog.log_skipped(ROLE_HERO, "NO_CATEGORY_FOR_TOPIC", context)
-            return None
-
-        pool = [
-            e for e in get_approved(role=ROLE_HERO)
-            if e.category in self._allowed_categories
-        ]
-
-        candidates = self._score_pool(pool, context or self._keyword, ROLE_HERO, self._allowed_categories)
-
-        if not candidates:
-            ilog.log_skipped(ROLE_HERO, "NO_CANDIDATE_PASSED_GATES", context)
-            return None
-
-        score, matched_kws, best = candidates[0]
-        sel = ImageSelection(
-            image_id=best.image_id, url=best.url, role=ROLE_HERO,
-            category=best.category, visual_cluster=best.visual_cluster,
-            relevance_score=score, context=context,
-        )
-        self._record(sel)
-        ilog.log_selected(ROLE_HERO, best.image_id, best.url,
-                          best.category, best.visual_cluster, score)
-        return best.url
+        return self._select_dynamic(context or self._keyword, ROLE_HERO)
 
     def section(self, context: str = "", index: int = 0) -> "str | None":
         """
-        Select section image for the given context/heading.
+        Select section image for the given heading/context.
 
-        Returns URL string or None. None means: no relevant image found for this
-        section — the slot is silently skipped. Article still publishes.
+        Returns URL string or None. None means: no relevant image found for
+        this section — the slot is silently skipped. Article still publishes.
 
-        Max MAX_SECTION_IMAGES section images per article (quality over quantity).
+        Max MAX_SECTION_IMAGES per article.
         """
-        if not self._allowed_categories:
-            ilog.log_skipped(ROLE_SECTION, "NO_CATEGORY_FOR_TOPIC", context)
-            return None
-
         if self._section_count >= MAX_SECTION_IMAGES:
-            ilog.log_skipped(
-                ROLE_SECTION,
-                f"MAX_SECTION_IMAGES_REACHED({MAX_SECTION_IMAGES})",
-                context,
+            log.info(
+                f"[IMAGE_SKIPPED] role=section  "
+                f"reason=MAX_SECTION_IMAGES_REACHED({MAX_SECTION_IMAGES})  "
+                f"context='{context[:60]}'"
             )
             return None
 
-        pool = [
-            e for e in get_approved(role=ROLE_SECTION)
-            if e.category in self._allowed_categories
-        ]
-
-        candidates = self._score_pool(pool, context, ROLE_SECTION, self._allowed_categories)
-
-        if not candidates:
-            ilog.log_skipped(ROLE_SECTION, "NO_CANDIDATE_PASSED_GATES", context)
-            return None
-
-        score, matched_kws, best = candidates[0]
-        sel = ImageSelection(
-            image_id=best.image_id, url=best.url, role=ROLE_SECTION,
-            category=best.category, visual_cluster=best.visual_cluster,
-            relevance_score=score, context=context,
-        )
-        self._record(sel)
-        self._section_count += 1
-        ilog.log_selected(ROLE_SECTION, best.image_id, best.url,
-                          best.category, best.visual_cluster, score)
-        return best.url
+        url = self._select_dynamic(context, ROLE_SECTION)
+        if url:
+            self._section_count += 1
+        return url
 
     def cta(self, slot: int = 0) -> str:
         """
-        Select CTA image for the given slot index.
+        Select CTA image for the given slot index from the static catalog.
 
         Never returns None — always provides an image for CTA blocks.
-        Only Gates 1–6 apply (no topic relevance required for decorative CTAs).
-        Rotates through available CTA pool to avoid within-post duplicates.
-        CTA images with reusable_cta=True may repeat across posts.
+        CTA images are reusable across posts (reusable_cta=True).
+        Rotates within-post to avoid duplicate CTA images in the same article.
         """
-        cta_pool  = get_approved(role=ROLE_CTA)
-        candidates = self._score_pool(cta_pool, f"cta_slot_{slot}", ROLE_CTA, [])
+        cta_pool = get_approved(role=ROLE_CTA, reusable_cta=True)
+        survivors = []
 
-        if candidates:
-            # Always pick the highest-scoring available (unused in this post) CTA.
-            # The pool is already filtered for local dedup in _score_pool.
-            score, matched_kws, best = candidates[0]
+        for entry in cta_pool:
+            # Skip URLs already used in this post
+            if entry.url in self._used_urls:
+                continue
+
+            passed, reason, score = _evaluate_cta_gates(
+                entry, self._used_clusters, self._registry
+            )
+            if passed:
+                survivors.append((score, entry))
+            else:
+                log.debug(f"[IMAGE_REJECTED_CTA] id={entry.image_id} reason={reason}")
+
+        if survivors:
+            survivors.sort(key=lambda x: -x[0])
+            score, best = survivors[0]
+
             sel = ImageSelection(
-                image_id=best.image_id, url=best.url, role=ROLE_CTA,
-                category=best.category, visual_cluster=best.visual_cluster,
-                relevance_score=score, context=f"cta_slot_{slot}",
+                image_id       = best.image_id,
+                url            = best.url,
+                role           = ROLE_CTA,
+                category       = best.category,
+                visual_cluster = best.visual_cluster,
+                relevance_score= score,
+                context        = f"cta_slot_{slot}",
+                source         = "static_catalog",
+                search_query   = "",
             )
             self._record(sel)
-            ilog.log_selected(ROLE_CTA, best.image_id, best.url,
-                              best.category, best.visual_cluster, score)
+
+            log.info(
+                f"[IMAGE_SELECTED] role=cta  "
+                f"id={best.image_id}  "
+                f"slot={slot}  "
+                f"url={best.url[:80]}"
+            )
             return best.url
 
-        # Hard fallback — should never happen with a clean catalog (3+ CTA images)
-        fallback = cta_pool[slot % len(cta_pool)] if cta_pool else None
-        if fallback:
+        # Hard fallback — should not happen with a correct catalog (3+ CTA images)
+        if cta_pool:
+            fallback = cta_pool[slot % len(cta_pool)]
             log.warning(
                 f"[IMAGE_SKIPPED] CTA slot={slot} pool exhausted — "
-                f"force fallback to {fallback.image_id}"
+                f"force-cycling to {fallback.image_id}"
             )
-            self._used_urls.add(fallback.url)
-            return fallback.url
+            self._used_urls.discard(fallback.url)  # allow reuse as last resort
+            return self.cta(slot)   # retry with cleared URL
 
         raise RuntimeError(
             "CTA pool is empty — add at least 3 approved CTA images to IMAGE_CATALOG"
@@ -510,11 +389,11 @@ class ImageSelectionService:
         Write all selections for this post to the Sheets registry.
 
         Call ONLY after:
-          1. All image selection is complete (hub.section/hero/cta all done).
+          1. All image selection is complete.
           2. Pre-publish validation has passed.
           3. HubSpot API call succeeded (or DRY_RUN).
 
-        Never call during selection. Writes are one-way and permanent.
+        Writes are one-way and permanent. Never call during selection.
         """
         if not self._selections:
             log.info(f"[IMAGE_REGISTRY_WRITTEN] No selections to commit for '{post_slug}'")
@@ -535,6 +414,9 @@ class ImageSelectionService:
                 category             = sel.category,
                 visual_cluster       = sel.visual_cluster,
                 selected_for_section = sel.context,
+                search_query         = sel.search_query,
+                image_source         = sel.source,
+                relevance_score      = sel.relevance_score,
                 selected_at          = ts,
             ))
 
@@ -546,11 +428,20 @@ class ImageSelectionService:
     def validation_report(self) -> dict:
         """
         Summary for publisher.py logging and hubspot.json 'images' field.
+
+        'unverified_ids' now only flags static-catalog images whose IDs are not
+        in APPROVED_IDS. Pexels API images are always considered verified
+        (they came from our authenticated API request).
         """
         all_ids  = [s.image_id for s in self._selections]
         counts   = Counter(all_ids)
         dupes    = [i for i, n in counts.items() if n > 1]
-        unverif  = [i for i in set(all_ids) if i not in APPROVED_IDS]
+
+        # Only flag static catalog images as unverified (pexels_api images are safe)
+        unverif = [
+            s.image_id for s in self._selections
+            if s.source == "static_catalog" and s.image_id not in APPROVED_IDS
+        ]
         sections = [s for s in self._selections if s.role == ROLE_SECTION]
 
         return {
@@ -559,7 +450,7 @@ class ImageSelectionService:
             "section_images":      len(sections),
             "duplicate_ids":       dupes or "none",
             "unverified_ids":      unverif or "none",
-            "allowed_categories":  self._allowed_categories or ["none (topic has no image category)"],
+            "topic_category":      self._topic_category,
             "selections": [
                 {
                     "role":           s.role,
@@ -567,7 +458,9 @@ class ImageSelectionService:
                     "category":       s.category,
                     "visual_cluster": s.visual_cluster,
                     "score":          round(s.relevance_score, 4),
-                    "context":        s.context,
+                    "source":         s.source,
+                    "search_query":   s.search_query[:60] if s.search_query else "",
+                    "context":        s.context[:60],
                 }
                 for s in self._selections
             ],

@@ -180,7 +180,7 @@ def run_publisher():
                                 f"  [IMAGES]  total={rpt['image_count']}"
                                 f"  unique={rpt['unique_image_count']}"
                                 f"  duplicates={rpt['duplicate_ids']}"
-                                f"  unverified={rpt['unverified_ids']}"
+                                f"  topic={rpt['topic_category']}"
                             )
                         log.info(
                             f"  [LINKS]   cluster={content.get('_cluster_links_count', 0)}"

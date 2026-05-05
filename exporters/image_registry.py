@@ -59,7 +59,9 @@ TAB_NAME = "Image Registry"
 HEADER_ROW = [
     "post_slug", "post_title", "article_keyword", "topic_cluster",
     "image_id", "image_url", "image_type", "category",
-    "visual_cluster", "selected_for_section", "selected_at",
+    "visual_cluster", "selected_for_section",
+    "search_query", "image_source", "relevance_score",
+    "selected_at",
 ]
 
 SCOPES = [
@@ -80,18 +82,24 @@ class RegistryEntry:
     topic_cluster: str
     image_id: str
     image_url: str
-    image_type: str          # hero / section / cta
+    image_type: str           # hero / section / cta
     category: str
     visual_cluster: str
-    selected_for_section: str   # section heading text (or "" for hero/cta)
-    selected_at: str            # UTC timestamp string
+    selected_for_section: str  # section heading text (or "" for hero/cta)
+    search_query: str          # Pexels search query used (or "" for static catalog)
+    image_source: str          # "pexels_api" | "static_catalog"
+    relevance_score: float     # composite score assigned at selection time
+    selected_at: str           # UTC timestamp string
 
     def to_row(self) -> list:
         return [
             self.post_slug, self.post_title, self.article_keyword,
             self.topic_cluster, self.image_id, self.image_url,
             self.image_type, self.category, self.visual_cluster,
-            self.selected_for_section, self.selected_at,
+            self.selected_for_section,
+            self.search_query, self.image_source,
+            str(round(self.relevance_score, 4)),
+            self.selected_at,
         ]
 
 
@@ -163,6 +171,12 @@ class ImageRegistry:
                     if not img_id:
                         continue
 
+                    # relevance_score is new — old rows have "" → default 0.0
+                    try:
+                        rel_score = float(row.get("relevance_score", 0) or 0)
+                    except (ValueError, TypeError):
+                        rel_score = 0.0
+
                     entry = RegistryEntry(
                         post_slug            = str(row.get("post_slug", "")),
                         post_title           = str(row.get("post_title", "")),
@@ -174,6 +188,9 @@ class ImageRegistry:
                         category             = str(row.get("category", "")),
                         visual_cluster       = cluster,
                         selected_for_section = str(row.get("selected_for_section", "")),
+                        search_query         = str(row.get("search_query", "")),
+                        image_source         = str(row.get("image_source", "static_catalog")),
+                        relevance_score      = rel_score,
                         selected_at          = str(row.get("selected_at", "")),
                     )
                     self._entries.append(entry)

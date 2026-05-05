@@ -144,12 +144,15 @@ def validate_post_package(hs_data):
     img_ids    = [m.group(1) for m in (re.search(r'/photos/(\d+)/', u) for u in img_urls) if m]
     id_counts  = Counter(img_ids)
     duplicates = [id_ for id_, n in id_counts.items() if n > 1]
-    unverified = [id_ for id_ in set(img_ids) if id_ not in APPROVED_PEXELS_IDS]
+    # With dynamic Pexels API fetching, IDs are not in a static approved set.
+    # Instead, verify all image URLs come from the trusted Pexels CDN.
+    # This catches any accidental non-Pexels images while allowing dynamic IDs.
+    untrusted  = [u for u in img_urls if "images.pexels.com" not in u]
 
     if duplicates:
         errors.append(f"Duplicate image IDs: {duplicates}")
-    if unverified:
-        errors.append(f"Unapproved image IDs (not in curated library): {unverified}")
+    if untrusted:
+        errors.append(f"Images from untrusted sources (must be images.pexels.com): {untrusted}")
     if len(img_urls) < MIN_IMAGES:
         errors.append(f"Only {len(img_urls)} image(s) — minimum is {MIN_IMAGES}")
     if len(img_urls) > MAX_IMAGES:
@@ -199,7 +202,7 @@ def validate_post_package(hs_data):
         "image_count":              len(img_urls),
         "unique_image_count":       len(set(img_urls)),
         "duplicate_images":         duplicates or "none",
-        "unverified_images":        unverified or "none",
+        "untrusted_image_sources":  untrusted or "none",
         "cta_count":                cta_count,
         "cta_blocks_present":       cta_count == 3,
         "cta_hrefs_valid":          len(unapproved_cta) == 0,
