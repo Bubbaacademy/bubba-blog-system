@@ -1,29 +1,31 @@
 """
 hubspot_files.py — Upload images to HubSpot Files API for permanent hosting.
 
-WHY THIS EXISTS
----------------
-DALL-E 3 generates images with temporary URLs (valid ~1 hour).
-We need permanent, publicly accessible URLs to embed in HubSpot blog posts.
-HubSpot's Files API accepts binary uploads and returns permanent CDN URLs.
-
 HOW IT WORKS
 ------------
-1. Download image from temporary URL (AI-generated or any source)
+1. Download image from temporary URL (Replicate CDN)
 2. POST to HubSpot Files API with the binary data
 3. HubSpot returns a permanent URL (e.g., hs.hubspotusercontent.com/...)
 4. Use that URL in blog post <img> tags
 
-FALLBACK
---------
-If upload fails for any reason, returns None.
-Caller (image_provider.py) then returns None for this slot.
-Article publishes without this image — never uses warehouse fallback.
+SCOPE CHECK
+-----------
+Before any Replicate generation, call check_hubspot_files_scope() to confirm
+the HUBSPOT_TOKEN has the 'files' scope. On 403, logs [HUBSPOT_FILES_SCOPE_MISSING]
+and returns False — no Replicate calls will be made.
 
 CONFIGURATION
 -------------
 Requires HUBSPOT_TOKEN in environment (already required for publishing).
 No additional credentials needed.
+
+REQUIRED SCOPES (HubSpot private app)
+--------------------------------------
+  files  (read + write)
+  crm.objects.blogs  (for blog publishing)
+
+To fix a 403: Private Apps → your app → Scopes → add files → Save →
+copy the new token → update HUBSPOT_TOKEN in Render env vars → redeploy.
 """
 from __future__ import annotations
 
@@ -53,12 +55,83 @@ def _sanitize_filename(name: str) -> str:
     return clean[:80] or "image"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Scope check — call once at provider startup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_hubspot_files_scope() -> bool:
+    """
+    Lightweight check that HUBSPOT_TOKEN has the 'files' scope.
+
+    Makes a GET /files/v3/files?limit=1 request.
+      200 → scope OK  → [HUBSPOT_FILES_SCOPE_CHECK_PASS]
+      403 → missing   → [HUBSPOT_FILES_SCOPE_MISSING]   → returns False
+      other / error   → inconclusive (network/5xx)      → returns True
+                        (don't block on transient infra failures)
+
+    Returns True if scope is confirmed or check was inconclusive.
+    Returns False ONLY on a confirmed 403 (token definitely missing files scope).
+    """
+    token = _get_token()
+    if not token:
+        log.warning(
+            "[HUBSPOT_FILES] HUBSPOT_TOKEN not set — "
+            "skipping scope check  "
+            "fix='set HUBSPOT_TOKEN in Render environment variables'"
+        )
+        return False
+
+    try:
+        resp = requests.get(
+            HUBSPOT_FILES_API,
+            headers={"Authorization": f"Bearer {token}"},
+            params={"limit": 1},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            log.info(
+                "[HUBSPOT_FILES_SCOPE_CHECK_PASS] "
+                "HubSpot Files API is accessible — token has required 'files' scope"
+            )
+            return True
+
+        if resp.status_code == 403:
+            log.error(
+                "[HUBSPOT_FILES_SCOPE_MISSING] "
+                "HubSpot Files API returned 403 Forbidden — token is missing 'files' scope.  "
+                "fix='In HubSpot: Settings → Private Apps → your app → Scopes → "
+                "enable files (read+write) → Save → copy new token → "
+                "update HUBSPOT_TOKEN in Render env vars → Redeploy.  "
+                "No Replicate images will be generated until this is fixed.'"
+            )
+            return False
+
+        # 401, 429, 500, etc. — treat as inconclusive
+        log.warning(
+            f"[HUBSPOT_FILES] Scope check inconclusive  "
+            f"status={resp.status_code}  treating_as=OK  "
+            f"body={resp.text[:120]}"
+        )
+        return True
+
+    except Exception as exc:
+        log.warning(
+            f"[HUBSPOT_FILES] Scope check failed with exception  "
+            f"error={exc}  treating_as=OK (may be transient network issue)"
+        )
+        return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Download helper
+# ─────────────────────────────────────────────────────────────────────────────
+
 def download_image(url: str, timeout: int = TIMEOUT) -> bytes | None:
     """
     Download an image from a URL into memory.
 
     Returns raw bytes or None on failure.
-    Works for DALL-E temporary URLs and Pexels CDN URLs.
+    Works for Replicate temporary CDN URLs.
     """
     try:
         resp = requests.get(url, timeout=timeout, stream=True)
@@ -77,6 +150,10 @@ def download_image(url: str, timeout: int = TIMEOUT) -> bytes | None:
         return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Upload helper
+# ─────────────────────────────────────────────────────────────────────────────
+
 def upload_to_hubspot(
     image_bytes: bytes,
     filename: str,
@@ -88,9 +165,9 @@ def upload_to_hubspot(
 
     Parameters
     ----------
-    image_bytes  : raw image bytes (from DALL-E or Pexels download)
+    image_bytes  : raw image bytes
     filename     : filename to use in HubSpot (e.g., "ppc-article-section-0.jpg")
-    folder_path  : HubSpot folder path (created automatically if missing)
+    folder_path  : HubSpot folder path (auto-created if missing)
     content_type : MIME type of the image
 
     Returns
@@ -138,10 +215,20 @@ def upload_to_hubspot(
                 public_url = data.get("url", "")
                 hs_id      = str(data.get("id", ""))
                 log.info(
-                    f"[HUBSPOT_FILES] Uploaded  file_id={hs_id}  "
+                    f"[HUBSPOT_FILE_UPLOADED] file_id={hs_id}  "
                     f"url={public_url[:80]}  filename={safe_filename}"
                 )
                 return public_url
+
+            elif resp.status_code == 403:
+                # Permission error — retrying won't help, bail immediately
+                log.error(
+                    f"[HUBSPOT_FILES_SCOPE_MISSING] Upload returned 403 Forbidden  "
+                    f"filename={safe_filename}  "
+                    f"fix='Add files scope to HubSpot private app token, save, "
+                    f"copy new token, update HUBSPOT_TOKEN in Render env vars'"
+                )
+                return None
 
             elif resp.status_code == 409:
                 # Duplicate — HubSpot already has this file; get existing URL
@@ -152,8 +239,8 @@ def upload_to_hubspot(
                 existing = _find_existing_file(safe_filename, folder_path, token)
                 if existing:
                     return existing
-                # If we can't find it, retry with a timestamped filename
-                ts_name  = _sanitize_filename(f"{filename}-{int(time.time())}")
+                # Retry with a timestamped filename
+                ts_name = _sanitize_filename(f"{filename}-{int(time.time())}")
                 if not ts_name.endswith(".jpg"):
                     ts_name += ".jpg"
                 safe_filename = ts_name
@@ -188,7 +275,7 @@ def _find_existing_file(filename: str, folder_path: str, token: str) -> str | No
     """Search HubSpot Files API for an existing file by name."""
     try:
         resp = requests.get(
-            "https://api.hubapi.com/files/v3/files",
+            HUBSPOT_FILES_API,
             headers={"Authorization": f"Bearer {token}"},
             params={"name": filename, "path": folder_path},
             timeout=10,
@@ -202,6 +289,10 @@ def _find_existing_file(filename: str, folder_path: str, token: str) -> str | No
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# High-level helper
+# ─────────────────────────────────────────────────────────────────────────────
+
 def upload_image_to_hubspot(
     source_url: str,
     article_slug: str,
@@ -213,7 +304,7 @@ def upload_image_to_hubspot(
 
     Parameters
     ----------
-    source_url   : temporary AI-generated URL or any image URL to download
+    source_url   : temporary Replicate CDN URL
     article_slug : used to build a meaningful filename
     slot_name    : "hero" | "section_0" | "section_1" | "cta_0" etc.
     folder_path  : HubSpot folder (default: /bubba-blog-images)

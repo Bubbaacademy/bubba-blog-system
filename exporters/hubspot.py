@@ -92,6 +92,10 @@ def _img_tag(img_url, alt_text, img_type="section", css_class="hs-blog-image"):
             f"[IMAGE_VALIDATION_BLOCKED] Rejected non-HubSpot URL: {img_url[:80]}"
         )
         return ""
+    import logging as _log
+    _log.getLogger("hubspot").info(
+        f"[IMAGE_VALIDATION_PASS] type={img_type}  url={img_url[:80]}"
+    )
     safe_alt = alt_text.replace('"', "'")
     return (
         f'<div class="hs-blog-image hs-blog-image--{img_type}">\n'
