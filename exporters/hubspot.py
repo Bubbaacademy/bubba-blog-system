@@ -15,7 +15,7 @@ import datetime
 import markdown as md
 from exporters.base import BaseExporter
 from exporters.file_export import get_export_path
-from exporters.image_selector import ImageTracker
+from exporters.image_selector import ImageSelectionService
 from config import (
     CTA_CONFIG, MID_CTA_CONFIGS, TOPIC_CLUSTER_LINKS, APPROVED_URLS,
     HUBSPOT_PORTAL_ID, HUBSPOT_FORM_ID, HUBSPOT_FORM_REGION,
@@ -532,12 +532,14 @@ def _build_post_body(row, content):
     intro, sections, faq_md = _split_article(article)
     faq_items = _parse_faq(faq_md) if faq_md else []
 
-    # One tracker per post — enforces no duplicate images within the post.
+    # One service per post — enforces no duplicate images within the post.
     # article_keyword + article_topic_cluster drive category gating: PPC/ads
     # topics receive no section images; warehouse/FBA topics get matched images.
-    tracker = ImageTracker(
+    service = ImageSelectionService(
         article_keyword=keyword,
         article_topic_cluster=row.get("Topic Cluster", ""),
+        article_title=title,
+        article_slug=_slugify(title),
     )
 
     # Determine self URL key to prevent self-linking
@@ -558,7 +560,7 @@ def _build_post_body(row, content):
     html_parts.append(f'<div class="hs-blog-intro">\n{intro_html}\n</div>')
 
     # ── CTA 1: Lead Magnet (captures reader after intro) ─────────────────────
-    html_parts.append(_cta_block_v2("lead-magnet", "after-introduction", 1, tracker.cta(0)))
+    html_parts.append(_cta_block_v2("lead-magnet", "after-introduction", 1, service.cta(0)))
 
     # ── Sections ──────────────────────────────────────────────────────────────
     section_img_idx  = 0
@@ -596,7 +598,7 @@ def _build_post_body(row, content):
         # In both cases we skip silently — the tracker already logged the reason.
         if (i + 1) % 2 == 0:
             context = heading_text + " " + keyword
-            img_url = tracker.section(context, section_img_idx)
+            img_url = service.section(context, section_img_idx)
             if img_url is not None:
                 img_alt = f"{heading_text} — {keyword} | Bubba Academy"
                 html_parts.append(_img_tag(img_url, img_alt, "section"))
@@ -605,7 +607,7 @@ def _build_post_body(row, content):
         # ── CTA 2: Contextual mid-article (topic-specific persuasion) ────────
         if i == mid - 1:
             html_parts.append(
-                _cta_block_v2("contextual", "mid-article", 2, tracker.cta(1), keyword)
+                _cta_block_v2("contextual", "mid-article", 2, service.cta(1), keyword)
             )
             mid_cta_injected = True
 
@@ -615,14 +617,14 @@ def _build_post_body(row, content):
     # always placed here, between intro and the HubSpot form.
     if not mid_cta_injected:
         html_parts.append(
-            _cta_block_v2("contextual", "mid-article", 2, tracker.cta(1), keyword)
+            _cta_block_v2("contextual", "mid-article", 2, service.cta(1), keyword)
         )
 
     # ── HubSpot Form (after conclusion, before conversion CTA) ───────────────
     html_parts.append(_hubspot_form_block())
 
     # ── CTA 3: Conversion (strong close — join / start business) ─────────────
-    html_parts.append(_cta_block_v2("conversion", "after-conclusion", 3, tracker.cta(2)))
+    html_parts.append(_cta_block_v2("conversion", "after-conclusion", 3, service.cta(2)))
 
     # ── FAQ ───────────────────────────────────────────────────────────────────
     if faq_items:
@@ -630,8 +632,9 @@ def _build_post_body(row, content):
 
     post_body = "\n".join(html_parts)
 
-    # Expose tracker + link counts to JSON builder via content dict
-    content["_image_tracker"]        = tracker
+    # Expose service + link counts via content dict.
+    # hubspot_api.py reads _image_service to call service.commit() after validation.
+    content["_image_service"]        = service
     content["_cluster_links_count"]  = cluster_links_total
     content["_brand_links_count"]    = brand_links_total
     return post_body
@@ -639,10 +642,14 @@ def _build_post_body(row, content):
 
 # ── Full hubspot.html ──────────────────────────────────────────────────────────
 
-def _build_hubspot_html(row, content, faq_items, faq_schema, article_schema):
+def _build_hubspot_html(row, content, faq_items, faq_schema, article_schema, post_body=None):
     seo_title = content.get("seo_title", "")
     meta_desc = content.get("meta_description", "")
-    post_body = _build_post_body(row, content)
+    # Accept pre-built post_body to avoid calling _build_post_body twice
+    # (double call would create two ImageSelectionService instances and select
+    # different images for the HTML file vs the JSON file).
+    if post_body is None:
+        post_body = _build_post_body(row, content)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -870,7 +877,7 @@ def _build_hubspot_json(row, content, export_path, post_body_html):
             },
         },
 
-        "images": content.get("_image_tracker", ImageTracker()).validation_report(),
+        "images": content.get("_image_service", ImageSelectionService()).validation_report(),
 
         "internal_links": {
             "cluster_links_injected": content.get("_cluster_links_count", 0),
@@ -927,11 +934,18 @@ class HubSpotExporter(BaseExporter):
                 },
             }
 
+            # Build post body once — reused for both the HTML file and JSON file.
+            # Passing post_body into _build_hubspot_html prevents a second call
+            # to _build_post_body which would create a duplicate ImageSelectionService
+            # and select different images for the two output files.
             post_body_html = _build_post_body(row, content)
 
             html_path = os.path.join(export_path, "hubspot.html")
             with open(html_path, "w", encoding="utf-8") as f:
-                f.write(_build_hubspot_html(row, content, faq_items, faq_schema, article_schema))
+                f.write(_build_hubspot_html(
+                    row, content, faq_items, faq_schema, article_schema,
+                    post_body=post_body_html,
+                ))
 
             json_path = os.path.join(export_path, "hubspot.json")
             with open(json_path, "w", encoding="utf-8") as f:

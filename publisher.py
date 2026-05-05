@@ -173,7 +173,7 @@ def run_publisher():
 
                     # Structured metrics after HubSpotExporter builds the post body
                     if "HubSpotExporter" in exporter.name() and "API" not in exporter.name():
-                        tracker = content.get("_image_tracker")
+                        tracker = content.get("_image_service")
                         if tracker:
                             rpt = tracker.validation_report()
                             log.info(

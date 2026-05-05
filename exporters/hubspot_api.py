@@ -30,7 +30,7 @@ from collections import Counter
 from dotenv import load_dotenv
 from exporters.base import BaseExporter
 from exporters.file_export import get_export_path
-from exporters.image_selector import APPROVED_PEXELS_IDS
+from exporters.image_catalog import APPROVED_IDS as APPROVED_PEXELS_IDS
 from config import (
     HUBSPOT_PORTAL_ID,
     HUBSPOT_BLOG_ID,
@@ -523,57 +523,35 @@ class HubSpotAPIExporter(BaseExporter):
                 json.dump(hs_data, f, indent=2, ensure_ascii=False)
             return {"success": False, "message": msg, "mode": "live", "validation": validation}
 
-        # ── Register images in global registry (validation passed) ─────────────
-        # Commit BEFORE the API call so images are reserved even if the API fails.
-        # Uses the Sheets-backed registry so IDs persist across Render deploys.
+        # ── Commit images to registry via ImageSelectionService ────────────────
+        # service.commit() writes all selections (with full metadata: image_id,
+        # role, category, visual_cluster) to the Sheets "Image Registry" tab.
+        # Called AFTER validation passes — only valid posts write to registry.
         try:
-            from exporters.sheets_image_registry import get_sheets_registry
-            body_for_imgs = hs_data.get("post", {}).get("postBody", "")
-            img_urls_used = re.findall(r'src="(https://[^"]+pexels[^"]+)"', body_for_imgs)
-            slug_for_reg  = hs_data.get("post", {}).get("slug", "unknown")
+            image_service   = content.get("_image_service")
+            slug_for_reg    = hs_data.get("post", {}).get("slug", "unknown")
+            title_for_reg   = row.get("Content Title", "")
+            kw_for_reg      = row.get("Main Keyword", "")
+            cluster_for_reg = row.get("Topic Cluster", "")
 
-            # Identify CTA vs section images by container class.
-            # _img_tag() in hubspot.py wraps every image in:
-            #   <div class="hs-blog-image hs-blog-image--{type}">
-            #     <img src="..." class="hs-cta-image OR hs-blog-image" .../>
-            #   </div>
-            # The data-cta-type div comes AFTER the img tag, so matching backwards
-            # from that div is unreliable. Match the container class instead.
-            cta_block_ids = set(
-                m.group(1)
-                for m in (
-                    re.search(r'/photos/(\d+)/', u)
-                    for u in re.findall(
-                        r'<div class="hs-blog-image hs-blog-image--cta">\s*'
-                        r'<img\s[^>]*src="(https://[^"]+pexels[^"]+)"',
-                        body_for_imgs,
-                        re.DOTALL,
-                    )
+            if image_service is not None:
+                image_service.commit(
+                    post_slug       = slug_for_reg,
+                    post_title      = title_for_reg,
+                    article_keyword = kw_for_reg,
+                    topic_cluster   = cluster_for_reg,
                 )
-                if m
-            )
-
-            log.info(
-                f"     [ImageRegistry] CTA image IDs detected in postBody: "
-                f"{sorted(cta_block_ids) or 'none'}"
-            )
-
-            entries = []
-            for u in img_urls_used:
-                m = re.search(r'/photos/(\d+)/', u)
-                if m:
-                    pid = m.group(1)
-                    img_type = "cta" if pid in cta_block_ids else "section"
-                    entries.append({"id": pid, "url": u, "type": img_type})
-
-            registry = get_sheets_registry()
-            registry.register_post(slug_for_reg, entries)
-            log.info(
-                f"     [ImageRegistry] Committed {len(entries)} image(s) for '{slug_for_reg}' "
-                f"(connected={registry._connected})"
-            )
+                log.info(
+                    f"     [IMAGE_REGISTRY_WRITTEN] Committed "
+                    f"{len(image_service._selections)} image(s) for '{slug_for_reg}'"
+                )
+            else:
+                log.warning(
+                    f"     [IMAGE_REGISTRY_WRITTEN] No _image_service in content — "
+                    f"registry not updated for '{slug_for_reg}'"
+                )
         except Exception as img_err:
-            log.warning(f"     [ImageRegistry] Could not commit images: {img_err}")
+            log.warning(f"     [IMAGE_REGISTRY_WRITTEN] Commit failed: {img_err}")
 
         # ── Step A: Create draft ───────────────────────────────────────────────
         post = hs_data.get("post", {})
