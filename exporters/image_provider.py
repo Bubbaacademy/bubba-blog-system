@@ -22,9 +22,12 @@ STARTUP CHECKS (in __init__)
 
 RATE-LIMIT PROTECTION
 ---------------------
-- Minimum 6-second gap between consecutive Replicate API calls (class-level).
-- On HTTP 429: retry up to 2 times with exponential backoff (30s, then 90s).
-- After all retries exhausted: _rate_limited=True, [IMAGE_VALIDATION_TEXT_ONLY] logged.
+- Minimum 12-second gap between consecutive Replicate API calls (class-level).
+  Logged as [REPLICATE_DELAY] sleeping=Xs before next generation.
+- On HTTP 429: retry up to 2 times with backoff (45s before attempt 2, 120s before attempt 3).
+  Each retry logged as [REPLICATE_RATE_LIMIT] attempt=X waiting=Ys.
+- After all retries exhausted: _rate_limited=True.
+  [IMAGE_GENERATION_ABORTED] reason=REPLICATE_RATE_LIMIT_EXHAUSTED is logged.
   All subsequent get_image() calls in this process return None immediately.
   Article publishes text-only. No more Replicate calls until process restarts.
 
@@ -76,8 +79,8 @@ APPROVED_REPLICATE_MODELS: dict[str, float] = {
 }
 
 _DEFAULT_MODEL    = "black-forest-labs/flux-schnell"
-_MIN_CALL_DELAY   = 6.0   # minimum seconds between consecutive Replicate API calls
-_RETRY_WAITS      = (30, 90)  # seconds to wait on 429 before attempt 2, attempt 3
+_MIN_CALL_DELAY   = 12.0  # minimum seconds between consecutive Replicate API calls
+_RETRY_WAITS      = (45, 120)  # seconds to wait on 429 before attempt 2, attempt 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,9 +146,11 @@ class ReplicateImageProvider(ImageProvider):
     Startup: checks package, token, model allowlist, and HubSpot Files scope.
     If any check fails: available=False, no Replicate calls are made.
 
-    Rate-limit protection: 6-second gap between calls, 2 retries on 429
-    (30s then 90s backoff). After all retries fail: rate_limited flag set,
-    all further calls skipped for this process run.
+    Rate-limit protection: 12-second minimum gap between calls (logged as
+    [REPLICATE_DELAY]). On 429: 2 retries with 45s then 120s backoff
+    (logged as [REPLICATE_RATE_LIMIT]). After all retries fail:
+    _rate_limited=True, [IMAGE_GENERATION_ABORTED] logged, all further
+    calls skipped for this process run. Article publishes text-only.
     """
 
     # ── Class-level state (shared across all instances) ───────────────────────
@@ -208,7 +213,8 @@ class ReplicateImageProvider(ImageProvider):
                 f"cost_per_image=${self._estimated_cost:.4f}  "
                 f"max_post=${self._max_post_cost:.2f}  "
                 f"max_day=${self._max_day_cost:.2f}  "
-                f"min_call_delay={_MIN_CALL_DELAY}s"
+                f"min_call_delay={_MIN_CALL_DELAY}s  "
+                f"retry_waits={_RETRY_WAITS[0]}s/{_RETRY_WAITS[1]}s"
             )
 
     # ── Model resolution ──────────────────────────────────────────────────────
@@ -288,9 +294,9 @@ class ReplicateImageProvider(ImageProvider):
         """
         Call client.run() with up to 2 retries on HTTP 429.
 
-        Retry schedule: wait 30s before attempt 2, wait 90s before attempt 3.
+        Retry schedule: wait 45s before attempt 2, wait 120s before attempt 3.
         If all 3 attempts return 429: set _rate_limited=True, log
-        [IMAGE_VALIDATION_TEXT_ONLY], return None.
+        [IMAGE_GENERATION_ABORTED] reason=REPLICATE_RATE_LIMIT_EXHAUSTED, return None.
 
         Non-429 exceptions are re-raised immediately (handled by get_image's
         outer except block).
@@ -316,14 +322,14 @@ class ReplicateImageProvider(ImageProvider):
                     log.warning(
                         f"[REPLICATE_RATE_LIMIT] slot={slot_name}  "
                         f"attempt={attempt + 1}/3  "
-                        f"waiting={wait}s before retry"
+                        f"waiting={wait}s"
                     )
                     time.sleep(wait)
                 else:
                     # All 3 attempts hit 429 — give up for this process run
                     ReplicateImageProvider._rate_limited = True
                     log.error(
-                        f"[IMAGE_VALIDATION_TEXT_ONLY] slot={slot_name}  "
+                        f"[IMAGE_GENERATION_ABORTED] slot={slot_name}  "
                         f"reason=REPLICATE_RATE_LIMIT_EXHAUSTED  "
                         f"article='{article_slug}'  "
                         f"all_remaining_image_slots=skipped  "
@@ -428,8 +434,9 @@ class ReplicateImageProvider(ImageProvider):
         if elapsed < _MIN_CALL_DELAY:
             sleep_for = _MIN_CALL_DELAY - elapsed
             log.info(
-                f"[IMAGE_PROVIDER] Rate-limit delay  "
-                f"sleeping={sleep_for:.1f}s  slot={slot_name}"
+                f"[REPLICATE_DELAY] sleeping={sleep_for:.1f}s  "
+                f"slot={slot_name}  "
+                f"reason=min_call_gap_enforcement  min_gap={_MIN_CALL_DELAY}s"
             )
             time.sleep(sleep_for)
 

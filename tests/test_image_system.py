@@ -4,7 +4,7 @@ tests/test_image_system.py — Replicate-only image pipeline verification.
 Run from project root:
     python3 tests/test_image_system.py
 
-30 tests covering:
+39 tests covering:
   A. Model allowlist (tests 1–4)
   B. Cost estimates (tests 5–6)
   C. Cost guard enforcement (tests 7–10)
@@ -15,6 +15,8 @@ Run from project root:
   H. Deduplication (tests 22–24)
   I. Zero-tolerance _img_tag() gate (tests 25–27)
   J. Code quality and security (tests 28–30)
+  K. HubSpot CDN URL validation — regional domains (tests 31–36)
+  L. Rate-limit delay and retry configuration (tests 37–39)
 
 All provider calls are MOCKED — no REPLICATE_API_TOKEN required.
 """
@@ -842,6 +844,70 @@ check(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION L — Rate-limit delay and retry configuration (tests 37–39)
+# ─────────────────────────────────────────────────────────────────────────────
+section("SECTION L — Tests 37–39: Rate-limit delay and retry configuration")
+
+from exporters.image_provider import _MIN_CALL_DELAY, _RETRY_WAITS
+
+# Test 37: Minimum inter-call delay is at least 12 seconds
+check(
+    "Test 37: _MIN_CALL_DELAY >= 12 seconds (avoids 429 in normal operation)",
+    _MIN_CALL_DELAY >= 12.0,
+    f"_MIN_CALL_DELAY={_MIN_CALL_DELAY}s  (expected >= 12.0)",
+)
+
+# Test 38: Retry waits are (45s, 120s) as specified
+check(
+    "Test 38: _RETRY_WAITS == (45, 120) — 45s before attempt 2, 120s before attempt 3",
+    _RETRY_WAITS == (45, 120),
+    f"_RETRY_WAITS={_RETRY_WAITS}  (expected (45, 120))",
+)
+
+# Test 39: _rate_limited flag blocks all further get_image() calls immediately
+#           (no Replicate API calls made when flag is set)
+_rl_buf = _io.StringIO()
+_rl_h   = _logging.StreamHandler(_rl_buf)
+_logging.getLogger("image_provider").addHandler(_rl_h)
+
+# Set the class-level flag directly (simulates post-exhaustion state)
+ReplicateImageProvider._rate_limited = True
+
+_rl_provider = ReplicateImageProvider()
+# Manually set the attributes get_image() checks so it reaches the rate-limit guard
+_rl_provider._pkg_available = True
+_rl_provider._token         = "r8_fake_token"
+_rl_provider._hs_scope_ok   = True
+_rl_provider._model         = "black-forest-labs/flux-schnell"
+
+# Build a minimal stub prompt
+class _StubPrompt:
+    text          = "test prompt"
+    prompt_hash   = "abc123"
+    topic_category = "general"
+
+_rl_result = _rl_provider.get_image(
+    prompt       = _StubPrompt(),
+    article_slug = "test-article",
+    slot_name    = "section_0",
+    registry     = build_mock_registry(),
+    used_urls    = set(),
+)
+_rl_log = _rl_buf.getvalue()
+_logging.getLogger("image_provider").removeHandler(_rl_h)
+
+# Restore class-level flag so other tests are not affected
+ReplicateImageProvider._rate_limited = False
+ReplicateImageProvider._LAST_CALL    = 0.0
+
+check(
+    "Test 39: _rate_limited=True blocks get_image() immediately — returns None, logs TEXT_ONLY",
+    _rl_result is None and "IMAGE_VALIDATION_TEXT_ONLY" in _rl_log,
+    f"result={_rl_result}  logged_text_only={'IMAGE_VALIDATION_TEXT_ONLY' in _rl_log}",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FINAL SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 70}")
@@ -858,6 +924,7 @@ if failed_count == 0:
     print(f"\n  ✓  ALL {len(_results)} TESTS PASSED — Replicate-only pipeline is production-ready")
     print("     Every image: Replicate Flux → HubSpot Files → hubspotusercontent domain")
     print("     All regional CDN variants accepted (na2, eu1, ap1, global .com)")
+    print("     Rate-limit guard: 12s min gap, 45s/120s retry backoff")
     print("     Zero OpenAI. Zero Pexels. Zero static warehouse catalog.")
 else:
     print(f"\n  ✗  {failed_count} TEST(S) FAILED — fix before deploying")
