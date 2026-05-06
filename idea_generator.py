@@ -1,43 +1,60 @@
 """
-idea_generator.py — Auto-fill the content queue when it is empty.
+idea_generator.py — Content queue management: fill, count, and threshold-refill.
 
-WHY THIS EXISTS
+TWO-CRON ARCHITECTURE
+---------------------
+This module powers both cron jobs:
+
+  6 AM PT  (0 13 * * * UTC — PDT offset; see DST note below)
+    python app.py --refill-ideas
+    → calls refill_if_needed(): if active_queue_count < IDEA_REFILL_THRESHOLD
+      (default 3) generate IDEA_BATCH_SIZE (default 5) fresh ideas.
+
+  7 AM PT  (0 14 * * * UTC — PDT offset)
+    python app.py --run-once
+    → calls run_pipeline(): run_agent() + run_publisher().
+    → Step 1b is an emergency fallback only (sheet completely empty).
+      Normal refills happen at 6 AM, not during publishing.
+
+DST NOTE
+--------
+Render cron uses UTC. The UTC expressions above are correct for PDT
+(UTC-7, roughly March–November). When clocks fall back to PST (UTC-8,
+November–March) the runs shift one hour earlier in local time.
+If exact local time matters, update the cron expressions after each
+DST transition:
+  PDT (UTC-7):  6 AM = 13:00 UTC,  7 AM = 14:00 UTC
+  PST (UTC-8):  6 AM = 14:00 UTC,  7 AM = 15:00 UTC
+
+QUEUE THRESHOLD
 ---------------
-The pipeline needs "Idea" rows in Google Sheets to generate content.
-Without this module, the user must manually create those rows.
-This module removes that requirement entirely.
+refill_if_needed() counts rows with Status ∈ {"Idea", "Draft Ready"}.
+  active_queue_count < IDEA_REFILL_THRESHOLD (default 3)
+    → generate IDEA_BATCH_SIZE (default 5) new ideas
+  active_queue_count >= IDEA_REFILL_THRESHOLD
+    → do nothing, log [IDEA_REFILL_SKIPPED]
 
-HOW IT WORKS
-------------
-1. Called by run_pipeline() in app.py when run_agent() found zero "Idea" rows.
-2. Checks whether any active work exists ("Idea" or "Draft Ready" rows):
-   - If yes → queue is not empty, just waiting for approval → log and exit.
-   - If no  → generate IDEA_BATCH_SIZE new ideas via Claude.
-3. Writes each idea as a new Google Sheet row with Status = "Idea".
-4. If REQUIRE_APPROVAL=false → also sets Approval = "Yes" immediately,
-   so run_agent() + run_publisher() can complete the full publish in one run.
-5. If REQUIRE_APPROVAL=true (default) → leaves Approval blank;
-   user sets "Yes" manually to trigger publishing.
+This ensures at least 3 posts are always in progress even after a burst
+of publishing, and prevents the 7 AM run from ever landing on an empty queue.
 
 ENVIRONMENT VARIABLES
 ---------------------
-REQUIRE_APPROVAL     "true" (default) | "false"
-                     false → auto-approves ideas, one post can publish per run
-                     true  → user must set Approval="Yes" in the sheet
-IDEA_BATCH_SIZE      How many ideas to generate per queue-fill (default: 5)
-IDEA_GENERATOR_MODEL Claude model for idea generation (default: claude-haiku-4-5)
-ANTHROPIC_API_KEY    Required (same key used by content_generator.py)
+REQUIRE_APPROVAL      "true" (default) | "false"
+IDEA_BATCH_SIZE       Ideas per refill batch (default: 5)
+IDEA_REFILL_THRESHOLD Min active rows before refill triggers (default: 3)
+IDEA_GENERATOR_MODEL  Claude model (default: claude-haiku-4-5)
+ANTHROPIC_API_KEY     Required
 
-STATUS FLOW (approval required)
----------------------------------
-  [auto]         [main.py]          [manual]       [publisher.py]
-  Status=Idea  →  Draft Ready  →  Approval=Yes  →  Exported
+STATUS FLOW (approval required — default)
+-----------------------------------------
+  [idea_generator]    [main.py]       [manual]       [publisher.py]
+    Status=Idea    → Draft Ready → Approval=Yes  →   Exported
 
-STATUS FLOW (no approval required, REQUIRE_APPROVAL=false)
------------------------------------------------------------
-  [auto]         [main.py]          [auto]         [publisher.py]
-  Status=Idea  →  Draft Ready  →  Approval=Yes  →  Exported
-  (Approval=Yes written at idea creation time; all steps run in one daily run)
+STATUS FLOW (REQUIRE_APPROVAL=false)
+------------------------------------
+  [idea_generator]    [main.py]       [auto]         [publisher.py]
+    Status=Idea    → Draft Ready → Approval=Yes  →   Exported
+    (Approval=Yes written at creation; all steps run in one 7 AM cycle)
 """
 from __future__ import annotations
 
@@ -52,8 +69,10 @@ log = logging.getLogger("idea_generator")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-_IDEA_MODEL  = os.environ.get("IDEA_GENERATOR_MODEL", "claude-haiku-4-5")
-_BATCH_SIZE  = int(os.environ.get("IDEA_BATCH_SIZE", "5"))
+_IDEA_MODEL        = os.environ.get("IDEA_GENERATOR_MODEL", "claude-haiku-4-5")
+_BATCH_SIZE        = int(os.environ.get("IDEA_BATCH_SIZE", "5"))
+_REFILL_THRESHOLD  = int(os.environ.get("IDEA_REFILL_THRESHOLD", "3"))
+
 
 def _require_approval() -> bool:
     """Read at call-time so runtime env changes are respected."""
@@ -134,23 +153,85 @@ evergreen and usable on a future publish date.\
 _ACTIVE_STATUSES = {STATUS_TRIGGER.lower(), STATUS_DRAFT_READY.lower()}
 
 
+def count_active_queue(sheet) -> int:
+    """
+    Count rows with Status = 'Idea' or 'Draft Ready'.
+
+    This is the canonical queue depth used by the refill threshold check.
+    Returns 0 on sheet-read error (safe: triggers refill rather than blocking it).
+    """
+    try:
+        rows = sheet.get_all_records()
+        return sum(
+            1 for row in rows
+            if str(row.get("Status", "")).strip().lower() in _ACTIVE_STATUSES
+        )
+    except Exception as exc:
+        log.warning(f"[IDEA_GENERATOR] Could not count active queue: {exc}  treating_as=0")
+        return 0
+
+
 def has_active_work(sheet) -> bool:
     """
     Return True if the sheet has any rows where Status is 'Idea' or 'Draft Ready'.
 
-    Used to avoid over-filling the queue: if work is already in progress
-    (waiting for content generation or waiting for approval) we do not
-    generate more ideas.
+    Used by the emergency fallback in run_pipeline() to decide whether to
+    generate ideas or just wait for approval. For scheduled refills, use
+    count_active_queue() + _REFILL_THRESHOLD instead.
     """
-    try:
-        rows = sheet.get_all_records()
-        return any(
-            str(row.get("Status", "")).strip().lower() in _ACTIVE_STATUSES
-            for row in rows
+    return count_active_queue(sheet) > 0
+
+
+# ── Threshold-based refill ────────────────────────────────────────────────────
+
+def refill_if_needed(sheet, batch_size: int = _BATCH_SIZE) -> dict:
+    """
+    Generate ideas only when the active queue is below the threshold.
+
+    Called by run_refill() in app.py (--refill-ideas, 6 AM PT / 0 13 * * * UTC).
+
+    Logic:
+      active_queue_count < _REFILL_THRESHOLD (default 3)
+        → generate `batch_size` (default 5) new ideas
+        → log [IDEA_REFILL_CREATED]
+      active_queue_count >= _REFILL_THRESHOLD
+        → do nothing
+        → log [IDEA_REFILL_SKIPPED]
+
+    Returns
+    -------
+    dict with keys:
+        ideas_written  : rows appended (0 if skipped)
+        skipped        : True if queue was above threshold
+        error          : error string or None
+    """
+    active_count = count_active_queue(sheet)
+
+    log.info(
+        f"[IDEA_QUEUE_STATUS] active_queue_count={active_count}  "
+        f"threshold={_REFILL_THRESHOLD}  "
+        f"action={'refill' if active_count < _REFILL_THRESHOLD else 'skip'}"
+    )
+
+    if active_count < _REFILL_THRESHOLD:
+        result = generate_ideas(sheet, count=batch_size)
+        log.info(
+            f"[IDEA_REFILL_CREATED] count={result.get('ideas_written', 0)}  "
+            f"previous_active={active_count}  "
+            f"new_total_estimate={active_count + result.get('ideas_written', 0)}"
         )
-    except Exception as exc:
-        log.warning(f"[IDEA_GENERATOR] Could not read sheet for queue check: {exc}")
-        return False  # treat as empty so we attempt generation
+        return {
+            "ideas_written": result.get("ideas_written", 0),
+            "skipped":       False,
+            "error":         result.get("error"),
+        }
+    else:
+        log.info(
+            f"[IDEA_REFILL_SKIPPED] reason=queue_above_threshold  "
+            f"active_queue_count={active_count}  "
+            f"threshold={_REFILL_THRESHOLD}"
+        )
+        return {"ideas_written": 0, "skipped": True, "error": None}
 
 
 # ── Claude client ─────────────────────────────────────────────────────────────

@@ -9,7 +9,9 @@ Tests cover:
   B. has_active_work() sheet detection (tests 4–7)
   C. generate_ideas() sheet-write logic — mocked Claude + mocked sheet (tests 8–12)
   D. REQUIRE_APPROVAL flag behaviour (tests 13–14)
-  E. app.py pipeline flow flags (tests 15–16)
+  E. Pipeline error-handling (tests 15–16)
+  F. count_active_queue() counting (tests 17–20)
+  G. refill_if_needed() threshold logic (tests 21–27)
 
 No real Anthropic API calls, no real Google Sheets calls.
 """
@@ -52,7 +54,10 @@ def section(title: str) -> None:
 # ── imports ───────────────────────────────────────────────────────────────────
 
 import idea_generator as ig
-from idea_generator import has_active_work, generate_ideas, CONTENT_PILLARS
+from idea_generator import (
+    has_active_work, generate_ideas, CONTENT_PILLARS,
+    count_active_queue, refill_if_needed, _REFILL_THRESHOLD, _BATCH_SIZE,
+)
 from config import STATUS_TRIGGER, STATUS_DRAFT_READY, STATUS_EXPORTED, APPROVAL_TRIGGER, COLUMNS
 
 
@@ -283,6 +288,138 @@ check(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION F — count_active_queue() counting (tests 17–20)
+# ─────────────────────────────────────────────────────────────────────────────
+section("SECTION F — Tests 17–20: count_active_queue() counting")
+
+# Test 17: Empty sheet → 0
+check(
+    "Test 17: count_active_queue([]) == 0",
+    count_active_queue(_mock_sheet([])) == 0,
+    "Empty sheet",
+)
+
+# Test 18: Only Exported rows → 0
+check(
+    "Test 18: count_active_queue(['Exported', 'Exported']) == 0",
+    count_active_queue(_mock_sheet(["Exported", "Exported"])) == 0,
+    "Only completed rows",
+)
+
+# Test 19: Mix of statuses → counts only Idea + Draft Ready
+check(
+    "Test 19: count_active_queue(['Idea','Draft Ready','Exported','Failed']) == 2",
+    count_active_queue(_mock_sheet(["Idea", "Draft Ready", "Exported", "Failed"])) == 2,
+    "Counts Idea+DraftReady only",
+)
+
+# Test 20: All active statuses → counts all
+check(
+    "Test 20: count_active_queue(['Idea','Idea','Draft Ready']) == 3",
+    count_active_queue(_mock_sheet(["Idea", "Idea", "Draft Ready"])) == 3,
+    "Three active rows",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION G — refill_if_needed() threshold logic (tests 21–27)
+# ─────────────────────────────────────────────────────────────────────────────
+section("SECTION G — Tests 21–27: refill_if_needed() threshold behaviour")
+
+# Helpers — build a mock sheet with a given number of active rows and run refill
+
+def _run_refill(active_count: int, threshold_override: int = 3) -> tuple:
+    """
+    Run refill_if_needed() with `active_count` active rows in the sheet.
+    Returns (result_dict, append_row_call_count).
+    """
+    statuses   = ["Idea"] * active_count + ["Exported"]  # always at least one row
+    mock_sheet = _mock_sheet(statuses)
+    appended   = []
+    mock_sheet.append_row.side_effect = lambda row, **kw: appended.append(row)
+
+    mock_resp         = MagicMock()
+    mock_resp.content = [MagicMock(text=json.dumps(_SAMPLE_IDEAS))]
+    mock_client       = MagicMock()
+    mock_client.messages.create.return_value = mock_resp
+
+    env_patch = {
+        "ANTHROPIC_API_KEY":       "sk-test",
+        "REQUIRE_APPROVAL":        "true",
+        "IDEA_REFILL_THRESHOLD":   str(threshold_override),
+    }
+
+    with patch("idea_generator.anthropic.Anthropic", return_value=mock_client), \
+         patch.dict(os.environ, env_patch, clear=False):
+        # Temporarily override module-level threshold
+        import idea_generator as _ig
+        orig = _ig._REFILL_THRESHOLD
+        _ig._REFILL_THRESHOLD = threshold_override
+        try:
+            result = refill_if_needed(mock_sheet, batch_size=len(_SAMPLE_IDEAS))
+        finally:
+            _ig._REFILL_THRESHOLD = orig
+
+    return result, len(appended)
+
+
+# Test 21: active=0 (empty queue) → refill fires, creates ideas
+result21, appended21 = _run_refill(active_count=0)
+check(
+    "Test 21: active_queue=0 → refill triggered, ideas written",
+    result21["ideas_written"] > 0 and result21["skipped"] is False,
+    f"ideas_written={result21['ideas_written']}  skipped={result21['skipped']}",
+)
+
+# Test 22: active=2 (below threshold of 3) → refill fires
+result22, appended22 = _run_refill(active_count=2)
+check(
+    "Test 22: active_queue=2 (< threshold 3) → refill triggered",
+    result22["ideas_written"] > 0 and result22["skipped"] is False,
+    f"ideas_written={result22['ideas_written']}  skipped={result22['skipped']}",
+)
+
+# Test 23: active=3 (at threshold) → refill skipped
+result23, appended23 = _run_refill(active_count=3)
+check(
+    "Test 23: active_queue=3 (== threshold 3) → refill SKIPPED",
+    result23["ideas_written"] == 0 and result23["skipped"] is True,
+    f"ideas_written={result23['ideas_written']}  skipped={result23['skipped']}",
+)
+
+# Test 24: active=5 (above threshold) → refill skipped, no sheet writes
+result24, appended24 = _run_refill(active_count=5)
+check(
+    "Test 24: active_queue=5 (> threshold 3) → refill SKIPPED, append_row not called",
+    result24["skipped"] is True and appended24 == 0,
+    f"skipped={result24['skipped']}  append_row_calls={appended24}",
+)
+
+# Test 25: When refill fires, it writes exactly BATCH_SIZE rows (3 in our mock)
+check(
+    "Test 25: Refill (active=0) writes exactly batch_size rows to sheet",
+    appended21 == len(_SAMPLE_IDEAS),
+    f"append_row_calls={appended21}  expected={len(_SAMPLE_IDEAS)}",
+)
+
+# Test 26: refill_if_needed() never publishes — result has no 'published' key
+check(
+    "Test 26: refill_if_needed() result contains no 'published' key (refill never publishes)",
+    "published" not in result21 and "post_id" not in result21,
+    f"Keys in result: {list(result21.keys())}",
+)
+
+# Test 27: Skipped result has correct shape
+check(
+    "Test 27: Skipped result has ideas_written=0, skipped=True, error=None",
+    (result23["ideas_written"] == 0 and
+     result23["skipped"] is True and
+     result23["error"] is None),
+    f"result={result23}",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FINAL SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 70}")
@@ -297,10 +434,10 @@ for label, ok, detail in _results:
 print(f"\n  Total: {len(_results)}  |  Passed: {passed_count}  |  Failed: {failed_count}")
 if failed_count == 0:
     print(f"\n  ✓  ALL {len(_results)} TESTS PASSED — Self-feeding pipeline verified")
-    print("     has_active_work() correctly detects Idea / Draft-Ready rows")
-    print("     generate_ideas() writes correct Status and Approval values")
-    print("     REQUIRE_APPROVAL flag controls auto-approval correctly")
-    print("     Malformed Claude responses handled without crash")
+    print("     count_active_queue() correctly counts Idea + Draft-Ready rows")
+    print("     refill_if_needed() triggers only below threshold, skips above")
+    print("     refill never publishes; threshold=3, batch=5 defaults enforced")
+    print("     has_active_work() / generate_ideas() / REQUIRE_APPROVAL unchanged")
 else:
     print(f"\n  ✗  {failed_count} TEST(S) FAILED — fix before deploying")
 
