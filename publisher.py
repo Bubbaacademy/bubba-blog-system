@@ -138,9 +138,32 @@ def run_publisher():
 
     if not approved:
         print("      No approved rows found. Nothing to export.")
+        log.info("[POST_SKIPPED] reason=no_approved_rows_found")
         return {"approved_found": 0, "exported": 0, "failed": 0}
 
     print(f"      Found {len(approved)} row(s) to export.")
+
+    # ── ONE-POST-PER-RUN SAFETY GUARD ─────────────────────────────────────────
+    # Each scheduled run processes exactly one post (the first approved row).
+    # Any additional approved rows are logged and deferred to the next run.
+    # This prevents accidental bulk-publishing and keeps daily output controlled.
+    if len(approved) > 1:
+        deferred = approved[1:]
+        for d in deferred:
+            deferred_title = d["row_data"].get("Content Title", "Untitled")
+            log.info(
+                f"[POST_SKIPPED] reason=one_post_per_run  "
+                f"title={deferred_title!r}  "
+                f"row_index={d['row_index']}  "
+                f"next_action=will_be_processed_on_next_scheduled_run"
+            )
+        log.info(
+            f"[POST_SKIPPED] {len(deferred)} additional row(s) deferred — "
+            f"only the first approved row is published per run."
+        )
+    approved = approved[:1]
+
+    print(f"      Processing 1 row (safety guard: one post per run).")
     print("\n[3/3] Running export pipeline...\n")
 
     success = 0
@@ -269,6 +292,10 @@ def run_publisher():
             write_hubspot_url(sheet, row_index, live_url)
             update_status(sheet, row_index, STATUS_EXPORTED)
             pub_label = "PUBLISHED" if published else "DRAFT (publish step failed — manual publish needed)"
+            log.info(
+                f"[POST_CREATED] title={title!r}  post_id={post_id}  "
+                f"hubspot_state={pub_label}  url={live_url}"
+            )
             log.info(f"  Status → '{STATUS_EXPORTED}'  Post ID: {post_id}  HubSpot: {pub_label}  URL: {live_url}")
             print(f"  Status updated to '{STATUS_EXPORTED}'.")
             print(f"  HubSpot Post ID: {post_id}")

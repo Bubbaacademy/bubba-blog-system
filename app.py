@@ -129,6 +129,10 @@ def run_pipeline(dry_run: bool = False):
         os.environ.setdefault("DRY_RUN", "false")
 
     run_start = datetime.datetime.utcnow()
+    log.info(
+        f"[CRON_START] date={_today}  utc={run_start.strftime('%H:%M:%S')}  "
+        f"dry_run={dry_run}  schedule='0 14 * * * (7:00 AM PT daily)'"
+    )
     log.info("=" * 56)
     log.info("  Bubba Content Agent — pipeline started")
     log.info(f"  Date:     {_today}  |  UTC: {run_start.strftime('%H:%M:%S')}")
@@ -173,11 +177,19 @@ def run_pipeline(dry_run: bool = False):
     log.info(f"  Publishing:  approved={pub_stats.get('approved_found', 0)}  "
              f"exported={pub_stats.get('exported', 0)}  "
              f"failed={pub_stats.get('failed', 0)}")
-    if gen_stats.get("error") or pub_stats.get("error"):
+    has_errors = bool(gen_stats.get("error") or pub_stats.get("error"))
+    if has_errors:
         log.error("  ERRORS DETECTED — review logs above.")
     else:
         log.info("  All steps completed without errors.")
     log.info("=" * 56)
+    log.info(
+        f"[CRON_END] success={not has_errors}  elapsed_s={elapsed:.1f}  "
+        f"ideas_found={gen_stats.get('ideas_found', 0)}  "
+        f"drafts_created={gen_stats.get('drafts_created', 0)}  "
+        f"posts_exported={pub_stats.get('exported', 0)}  "
+        f"posts_failed={pub_stats.get('failed', 0)}"
+    )
 
     return {"generation": gen_stats, "publishing": pub_stats, "elapsed_s": elapsed}
 
