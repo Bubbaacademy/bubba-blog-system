@@ -141,9 +141,12 @@ def run_pipeline(dry_run: bool = False):
 
     _check_env()
 
-    gen_stats = pub_stats = {}
+    gen_stats  = {}
+    pub_stats  = {}
+    idea_stats = {}
 
     # ── Step 1: Content Generation ────────────────────────────────────────────
+    # Processes any rows with Status = "Idea" → generates blog content → "Draft Ready"
     log.info("")
     log.info("── STEP 1: Content Generation ──────────────────────────")
     try:
@@ -154,7 +157,57 @@ def run_pipeline(dry_run: bool = False):
         log.error(f"  Content generation failed: {e}")
         gen_stats = {"error": str(e)}
 
+    # ── Step 1b: Auto-fill idea queue if it was empty ────────────────────────
+    # If run_agent() found zero "Idea" rows the queue may be dry.
+    # Check the sheet: if no active work ("Idea" or "Draft Ready" rows) exists,
+    # generate a fresh batch of ideas so the next run has something to process.
+    # If REQUIRE_APPROVAL=false the ideas are pre-approved and the content
+    # generator + publisher run immediately in the same pipeline cycle.
+    if gen_stats.get("ideas_found", 0) == 0 and not gen_stats.get("error"):
+        log.info("")
+        log.info("── STEP 1b: Idea Queue Check ───────────────────────────")
+        try:
+            from sheets_client import get_sheet as _get_sheet
+            from idea_generator import has_active_work, generate_ideas, _require_approval
+
+            _sheet = _get_sheet()
+
+            if has_active_work(_sheet):
+                # "Draft Ready" rows exist but none are approved yet — just wait
+                log.info(
+                    "[NO_APPROVED_ROWS_FOUND] Ideas or Draft-Ready rows exist "
+                    "but no Approval='Yes' found — nothing to generate"
+                )
+                log.info(
+                    "[WAITING_FOR_APPROVAL] Set Approval='Yes' in Google Sheets "
+                    "column M to trigger publishing on the next run"
+                )
+            else:
+                # Queue is truly empty — generate fresh ideas
+                idea_stats = generate_ideas(_sheet)
+
+                if idea_stats.get("ideas_written", 0) > 0 and not _require_approval():
+                    # No-approval mode: immediately process the ideas we just created
+                    log.info(
+                        "  REQUIRE_APPROVAL=false — running second content-generation "
+                        "pass to process newly created ideas in this cycle"
+                    )
+                    try:
+                        gen_stats2 = run_agent() or {}
+                        # Merge stats so the final summary reflects both passes
+                        gen_stats["ideas_found"]    = (gen_stats.get("ideas_found", 0)
+                                                        + gen_stats2.get("ideas_found", 0))
+                        gen_stats["drafts_created"] = (gen_stats.get("drafts_created", 0)
+                                                        + gen_stats2.get("drafts_created", 0))
+                        log.info(f"  Second-pass generation: {gen_stats2}")
+                    except Exception as e2:
+                        log.error(f"  Second-pass content generation failed: {e2}")
+
+        except Exception as e:
+            log.error(f"  Idea queue check/generation failed: {e}")
+
     # ── Step 2: Publishing ────────────────────────────────────────────────────
+    # Processes first row with Status = "Draft Ready" + Approval = "Yes" → Exported
     log.info("")
     log.info("── STEP 2: Publishing ──────────────────────────────────")
     try:
@@ -165,16 +218,31 @@ def run_pipeline(dry_run: bool = False):
         log.error(f"  Publisher failed: {e}")
         pub_stats = {"error": str(e)}
 
+    # Log a clear waiting message when nothing was approved
+    if pub_stats.get("approved_found", 0) == 0 and not pub_stats.get("error"):
+        if idea_stats.get("ideas_written", 0) > 0:
+            log.info(
+                "[NO_APPROVED_ROWS_FOUND] New ideas were just created — "
+                "content generation will run on next scheduled run"
+            )
+        log.info(
+            "[WAITING_FOR_APPROVAL] No posts published this run. "
+            "To publish: set Approval='Yes' in Google Sheets column M "
+            "for any row with Status='Draft Ready'."
+        )
+
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = (datetime.datetime.utcnow() - run_start).total_seconds()
     log.info("")
     log.info("=" * 56)
     log.info("  Pipeline complete")
-    log.info(f"  Elapsed:     {elapsed:.1f}s")
-    log.info(f"  Generation:  ideas={gen_stats.get('ideas_found', 0)}  "
+    log.info(f"  Elapsed:       {elapsed:.1f}s")
+    log.info(f"  Ideas queued:  generated={idea_stats.get('ideas_generated', 0)}  "
+             f"written={idea_stats.get('ideas_written', 0)}")
+    log.info(f"  Generation:    ideas_processed={gen_stats.get('ideas_found', 0)}  "
              f"drafts={gen_stats.get('drafts_created', 0)}  "
              f"failed={gen_stats.get('failed', 0)}")
-    log.info(f"  Publishing:  approved={pub_stats.get('approved_found', 0)}  "
+    log.info(f"  Publishing:    approved={pub_stats.get('approved_found', 0)}  "
              f"exported={pub_stats.get('exported', 0)}  "
              f"failed={pub_stats.get('failed', 0)}")
     has_errors = bool(gen_stats.get("error") or pub_stats.get("error"))
@@ -185,13 +253,19 @@ def run_pipeline(dry_run: bool = False):
     log.info("=" * 56)
     log.info(
         f"[CRON_END] success={not has_errors}  elapsed_s={elapsed:.1f}  "
-        f"ideas_found={gen_stats.get('ideas_found', 0)}  "
+        f"ideas_auto_generated={idea_stats.get('ideas_written', 0)}  "
+        f"ideas_processed={gen_stats.get('ideas_found', 0)}  "
         f"drafts_created={gen_stats.get('drafts_created', 0)}  "
         f"posts_exported={pub_stats.get('exported', 0)}  "
         f"posts_failed={pub_stats.get('failed', 0)}"
     )
 
-    return {"generation": gen_stats, "publishing": pub_stats, "elapsed_s": elapsed}
+    return {
+        "ideas":       idea_stats,
+        "generation":  gen_stats,
+        "publishing":  pub_stats,
+        "elapsed_s":   elapsed,
+    }
 
 
 # ── CLI entrypoint ────────────────────────────────────────────────────────────
