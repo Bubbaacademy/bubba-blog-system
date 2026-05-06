@@ -35,6 +35,7 @@ import re
 import time
 import logging
 import requests
+from urllib.parse import urlparse
 
 log = logging.getLogger("hubspot_files")
 
@@ -42,6 +43,32 @@ HUBSPOT_FILES_API = "https://api.hubapi.com/files/v3/files"
 DEFAULT_FOLDER    = "/bubba-blog-images"
 MAX_RETRIES       = 2
 TIMEOUT           = 30   # seconds for download + upload
+
+
+def is_trusted_hubspot_image_url(url: str) -> bool:
+    """
+    Return True if *url* is a valid, trusted HubSpot CDN image URL.
+
+    Accepts any HTTPS URL whose hostname contains 'hubspotusercontent'.
+    This covers every regional variant HubSpot currently uses:
+
+      - files.hubspotusercontent.com          (global)
+      - 243737166.fs1.hubspotusercontent-na2.net  (North America)
+      - hubspotusercontent-eu1.net             (Europe)
+      - hubspotusercontent-ap1.net             (Asia-Pacific)
+
+    Rejects:
+      - Empty / None
+      - http:// (non-HTTPS)
+      - replicate.delivery, pexels.com, etc.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme == "https" and "hubspotusercontent" in parsed.netloc.lower()
+    except Exception:
+        return False
 
 
 def _get_token() -> str:

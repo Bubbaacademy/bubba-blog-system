@@ -81,18 +81,21 @@ def _img_tag(img_url, alt_text, img_type="section", css_class="hs-blog-image"):
     """
     Renders a real image tag with a verified URL. No placeholders.
     Returns empty string if img_url is None — caller skips the block.
-    Only hubspotusercontent.com URLs are accepted; anything else is blocked.
+
+    Accepts any HTTPS URL on a hubspotusercontent domain (all regional variants):
+      hubspotusercontent.com, hubspotusercontent-na2.net, -eu1.net, -ap1.net, etc.
+    Rejects everything else — Pexels, Replicate temp URLs, http://, etc.
     """
+    import logging as _log
+    from exporters.hubspot_files import is_trusted_hubspot_image_url
     if not img_url:
         return ""
     # Hard block: reject any non-HubSpot URL before it enters the HTML
-    if "hubspotusercontent.com" not in img_url:
-        import logging as _log
+    if not is_trusted_hubspot_image_url(img_url):
         _log.getLogger("hubspot").warning(
             f"[IMAGE_VALIDATION_BLOCKED] Rejected non-HubSpot URL: {img_url[:80]}"
         )
         return ""
-    import logging as _log
     _log.getLogger("hubspot").info(
         f"[IMAGE_VALIDATION_PASS] type={img_type}  url={img_url[:80]}"
     )

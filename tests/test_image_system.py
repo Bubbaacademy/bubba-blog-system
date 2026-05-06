@@ -64,8 +64,9 @@ def section(title: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 from exporters.image_provider import ImageAsset, ImageProvider, APPROVED_REPLICATE_MODELS
+from exporters.hubspot_files import is_trusted_hubspot_image_url
 
-# HubSpot Files CDN domain — all AI images must land here
+# HubSpot CDN base used in mock URLs (the .com variant is valid everywhere)
 HS_CDN = "hubspotusercontent.com"
 _DEFAULT_MODEL_NAME = "black-forest-labs/flux-schnell"
 
@@ -567,7 +568,7 @@ check(
 # ─────────────────────────────────────────────────────────────────────────────
 section("SECTION G — Tests 18–21: Image generation with MockReplicateProvider")
 
-# Test 18: Section returns hubspotusercontent.com URL
+# Test 18: Section returns a trusted HubSpot CDN URL (any regional variant)
 ppc_svc = build_service(
     "amazon ppc budget optimization",
     "Amazon Advertising",
@@ -575,8 +576,8 @@ ppc_svc = build_service(
 )
 ppc_url = ppc_svc.section("How to Set Your PPC Budget", 0)
 check(
-    "Test 18: Section image URL is from HubSpot CDN (hubspotusercontent.com)",
-    ppc_url is not None and HS_CDN in ppc_url,
+    "Test 18: Section image URL is a trusted HubSpot CDN URL",
+    ppc_url is not None and is_trusted_hubspot_image_url(ppc_url),
     f"URL: {ppc_url}",
 )
 
@@ -701,7 +702,7 @@ check(
     f"Got non-empty for Pexels URL — BLOCKED needed",
 )
 
-# Test 27: Valid HubSpot CDN URL → renders <img> tag
+# Test 27: Valid HubSpot CDN URL (.com variant) → renders <img> tag
 hs_url = f"https://files.{HS_CDN}/hubfs/bubba-blog-images/test-image.jpg"
 hs_tag = _img_tag(hs_url, "Test image")
 check(
@@ -784,6 +785,63 @@ check(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION K — HubSpot CDN URL validation (tests 31–36)
+# ─────────────────────────────────────────────────────────────────────────────
+section("SECTION K — Tests 31–36: is_trusted_hubspot_image_url() + regional CDN")
+
+# Test 31: .com global variant → accepted
+check(
+    "Test 31: is_trusted_hubspot_image_url accepts .com variant",
+    is_trusted_hubspot_image_url(
+        "https://files.hubspotusercontent.com/hubfs/bubba-blog-images/img.jpg"
+    ),
+    "Global .com domain",
+)
+
+# Test 32: North-America regional domain → accepted
+_na2_url = "https://243737166.fs1.hubspotusercontent-na2.net/hubfs/243737166/bubba-blog-img/section.jpg"
+check(
+    "Test 32: is_trusted_hubspot_image_url accepts hubspotusercontent-na2.net",
+    is_trusted_hubspot_image_url(_na2_url),
+    f"URL: {_na2_url[:80]}",
+)
+
+# Test 33: Europe regional domain → accepted
+check(
+    "Test 33: is_trusted_hubspot_image_url accepts hubspotusercontent-eu1.net",
+    is_trusted_hubspot_image_url(
+        "https://files.hubspotusercontent-eu1.net/hubfs/123/img.jpg"
+    ),
+    "EU regional domain",
+)
+
+# Test 34: Replicate temp URL → rejected
+_replicate_url = "https://replicate.delivery/xezq/AIZLOHLdiTKoLVZFF69aKBiTuNUpe7aj/image.jpg"
+check(
+    "Test 34: is_trusted_hubspot_image_url rejects replicate.delivery URLs",
+    not is_trusted_hubspot_image_url(_replicate_url),
+    f"Replicate URL must be rejected: {_replicate_url[:60]}",
+)
+
+# Test 35: HTTP (not HTTPS) hubspotusercontent URL → rejected
+check(
+    "Test 35: is_trusted_hubspot_image_url rejects http:// (non-HTTPS)",
+    not is_trusted_hubspot_image_url(
+        "http://files.hubspotusercontent.com/hubfs/img.jpg"
+    ),
+    "http:// must be rejected (only https:// accepted)",
+)
+
+# Test 36: _img_tag() accepts the real regional CDN URL that was blocked in prod
+_img_tag_na2_tag = _img_tag(_na2_url, "Regional CDN image")
+check(
+    "Test 36: _img_tag() accepts hubspotusercontent-na2.net URL and renders <img>",
+    "<img" in _img_tag_na2_tag and f'src="{_na2_url}"' in _img_tag_na2_tag,
+    f"Tag snippet: {_img_tag_na2_tag[:120]}",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FINAL SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 70}")
@@ -797,8 +855,9 @@ for label, ok, detail in _results:
 
 print(f"\n  Total: {len(_results)}  |  Passed: {passed_count}  |  Failed: {failed_count}")
 if failed_count == 0:
-    print("\n  ✓  ALL 30 TESTS PASSED — Replicate-only pipeline is production-ready")
-    print("     Every image: Replicate Flux → HubSpot Files → hubspotusercontent.com")
+    print(f"\n  ✓  ALL {len(_results)} TESTS PASSED — Replicate-only pipeline is production-ready")
+    print("     Every image: Replicate Flux → HubSpot Files → hubspotusercontent domain")
+    print("     All regional CDN variants accepted (na2, eu1, ap1, global .com)")
     print("     Zero OpenAI. Zero Pexels. Zero static warehouse catalog.")
 else:
     print(f"\n  ✗  {failed_count} TEST(S) FAILED — fix before deploying")
